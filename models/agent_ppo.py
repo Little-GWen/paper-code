@@ -30,13 +30,23 @@ class Agent_PPO:
         self.mse_loss = nn.MSELoss()
         self.entropy = 0
 
-    def act(self, state):
+    def act(self, state, deterministic=False):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
             action_probs = self.actor(state)
-        dist = torch.distributions.Categorical(action_probs)
-        action_tensor = dist.sample()
-        return action_tensor.cpu().numpy().item(), dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        if deterministic:
+            action_tensor = torch.argmax(action_probs, dim=1)
+            log_prob = 0.0
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        # --- [终极修复] 强制转为 Python int ---
+        action_val = action_tensor.cpu().numpy()
+        action_val = action_val.flatten()
+        return int(action_val[0]), log_prob
 
     def learn(self, current_total_timesteps):
         states, actions, rewards, next_states, dones, logprobs = self.memory.get_all_and_clear()

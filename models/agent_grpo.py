@@ -8,16 +8,27 @@ from models.replay_buffer import Replay_Buffer
 
 
 class Agent_GRPO:
+    """
+    GRPO Agent (修复版：降低约束强度)
+    """
+
     def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
                  critic_loss_coef, entropy_coef, device, shared=False, manager=None, is_worker=False,
                  use_dynamic_beta=True):
-        self.state_size, self.action_size = state_size, action_size
-        self.bs, self.lr, self.dr, self.decay_step_size = bs, lr, dr, decay_step_size
-        self.gamma, self.K_epochs, self.entropy_coef = gamma, K_epochs, entropy_coef
+        self.state_size = state_size
+        self.action_size = action_size
+        self.bs = bs
+        self.lr = lr
+        self.dr = dr
+        self.decay_step_size = decay_step_size
+        self.gamma = gamma
+        self.K_epochs = K_epochs
+        self.entropy_coef = entropy_coef
         self.device = device
         self.use_dynamic_beta = use_dynamic_beta
 
-        # --- [优化] 降低初始Beta，防止早期锁死 ---
+        # --- [修复 1] 降低初始 Beta ---
+        # 原来 0.1 太大了，改为 0.01
         self.beta_init = 0.01
         self.beta = self.beta_init
 
@@ -30,16 +41,24 @@ class Agent_GRPO:
         if not is_worker: self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
         self.entropy = 0
 
-    def act(self, state):
+    def act(self, state, deterministic=False):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
             action_probs = self.actor(state)
-        dist = torch.distributions.Categorical(action_probs)
-        action_tensor = dist.sample()
-        return action_tensor.cpu().numpy().item(), dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        if deterministic:
+            action_tensor = torch.argmax(action_probs, dim=1)
+            log_prob = 0.0
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        # 强制转 Python int 防止报错
+        action_val = action_tensor.cpu().numpy().flatten()
+        return int(action_val[0]), log_prob
 
     def calculate_risk(self, state):
-        # 修复维度问题: (Batch, 75) -> (Batch, 15, 5)
         if state.shape[1] < 10: return 0.0
         batch_size = state.shape[0]
         num_feats = 5
@@ -53,8 +72,9 @@ class Agent_GRPO:
 
         dists = torch.sqrt((others_x - ego_x.unsqueeze(1)) ** 2 + (others_y - ego_y.unsqueeze(1)) ** 2)
         min_dist, _ = torch.min(torch.clamp(dists, min=0.5), dim=1)
-        risk = torch.clamp(10.0 / min_dist, 0.0, 5.0)
-        return risk.mean().item()
+
+        # 归一化风险
+        return (10.0 / min_dist).mean().item()
 
     def learn(self, current_total_timesteps):
         states, actions, rewards, next_states, dones, logprobs = self.memory.get_all_and_clear()
@@ -73,13 +93,15 @@ class Agent_GRPO:
             returns.insert(0, G)
         returns = torch.tensor(returns, dtype=torch.float32).to(self.device)
 
-        # Group Norm (防止数值爆炸)
+        # Group Norm
         adv_mean, adv_std = returns.mean(), returns.std() + 1e-5
         advantages = torch.clamp((returns - adv_mean) / adv_std, -3.0, 3.0)
 
+        # --- [修复 2] 给动态 Beta 加更严格的上限 ---
         if self.use_dynamic_beta:
             current_risk = self.calculate_risk(states)
-            self.beta = min(self.beta_init * (1 + current_risk), 0.5)  # 限制上限
+            # 上限从 2.0 降到 0.2，防止锁死
+            self.beta = min(self.beta_init * (1 + current_risk), 0.2)
         else:
             self.beta = self.beta_init
 
@@ -102,10 +124,12 @@ class Agent_GRPO:
                 dist_entropy = dist.entropy().mean()
 
                 ratio = torch.exp(mb_new_log - mb_old_log)
-                with torch.no_grad(): approx_kl = 0.5 * ((mb_new_log - mb_old_log) ** 2).mean()
+                with torch.no_grad():
+                    approx_kl = 0.5 * ((mb_new_log - mb_old_log) ** 2).mean()
 
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 0.8, 1.2) * mb_adv
+
                 loss = -torch.min(surr1, surr2).mean() + \
                        self.beta * approx_kl - \
                        self.entropy_coef * decay * dist_entropy

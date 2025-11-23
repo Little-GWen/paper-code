@@ -11,7 +11,7 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 RAM_ENV_NAME = 'highway-v0'
 
 # 训练参数
-NUM_PROCESSES = 5        # 多进程数量
+NUM_PROCESSES = 10        # 多进程数量
 BATCH_SIZE = 256
 LEARNING_RATE = 0.0003
 
@@ -31,7 +31,7 @@ CRITIC_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.05
 
 # 训练时长
-RAM_NUM_EPISODE = 20000
+RAM_NUM_EPISODE = 8000
 MAX_T = 1000             # 单回合最大步数 (需 >= custom_env.py 中的 duration)
 
 # 可视化参数

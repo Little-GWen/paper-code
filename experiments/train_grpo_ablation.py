@@ -26,13 +26,16 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
     global_step = Value('i', 0)
     episode_lock = manager.Lock();
     save_lock = manager.Lock()
+
     rewards_log = manager.list()
+    speed_log = manager.list()
+    collision_log = manager.list()
 
     processes = []
     for pid in range(num_processes):
         p = mp.Process(target=sample_worker, args=(
         env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue, stop_event,
-        max_t, save_lock, rewards_log, agent.use_dynamic_beta))
+        max_t, save_lock, rewards_log, speed_log, collision_log, agent.use_dynamic_beta))
         p.start();
         processes.append(p)
 
@@ -52,6 +55,8 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
                         np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+                        np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+                        np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
                 new_state_dict = agent.get_state_dict()
                 while not param_queue.empty(): param_queue.get()
                 for _ in range(num_processes): param_queue.put(new_state_dict)
@@ -62,14 +67,14 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
 
     torch.save(agent.actor.state_dict(), weights_path)
     np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+    np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+    np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
 
 
 def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
-                  stop_event, max_t, save_lock, rewards_log, use_dynamic_beta):
+                  stop_event, max_t, save_lock, rewards_log, speed_log, collision_log, use_dynamic_beta):
     env = gym.make(env_id)
-    # --- [关键修复] ---
     state_dim = int(np.prod(env.observation_space.shape))
-    # ----------------
     local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
                              GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                              manager=None, is_worker=True, use_dynamic_beta=use_dynamic_beta)
@@ -86,20 +91,26 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
         state = env.reset()
         if isinstance(state, tuple): state = state[0]
         state = state.flatten()
-        ep_reward, steps = 0, 0;
+        ep_reward, ep_speed, steps = 0, 0, 0;
         done = False
+        is_crashed = 0
         while not done and steps < max_t:
             with global_step.get_lock():
                 global_step.value += 1
             steps += 1
+            if len(state) >= 3: ep_speed += state[2]
+
             state_tensor = torch.FloatTensor(state).to(local_agent.device)
             action, log_prob = local_agent.act(state_tensor)
             res = env.step(action)
             if len(res) == 5:
-                next_state, reward, term, trunc, _ = res
+                next_state, reward, term, trunc, info = res
             else:
-                next_state, reward, done, _ = res
+                next_state, reward, done, info = res
             done = term or trunc if len(res) == 5 else done
+
+            if info.get('crashed', False): is_crashed = 1
+
             next_state = next_state.flatten()
             shared_memory.remember((state, action, reward, next_state, done, log_prob))
             state = next_state.copy()
@@ -111,6 +122,8 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
                     pass
         with save_lock:
             rewards_log.append(ep_reward)
+            speed_log.append(ep_speed / max(1, steps))
+            collision_log.append(is_crashed)
         if pid == 0: print(f'\rEp {ep} Rew {ep_reward:.1f}', end='')
     env.close()
 
@@ -121,15 +134,11 @@ if __name__ == '__main__':
     set_seed(args.seed)
     save_dir = f'results/grpo_{args.mode}/seed_{args.seed}'
     use_dyn = False if args.mode == 'no_dynamic' else True
-
     with mp.Manager() as manager:
         dummy = gym.make(RAM_ENV_NAME)
-        # --- [关键修复] ---
         state_dim = int(np.prod(dummy.observation_space.shape))
         act_dim = dummy.action_space.n
         dummy.close()
-        # ----------------
-
         agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
                            LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                            manager=manager, is_worker=False, use_dynamic_beta=use_dyn)
