@@ -1,0 +1,129 @@
+import sys, os, argparse
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+from multiprocessing import Process, Manager, Value, Lock
+import gym, torch, time
+import torch.multiprocessing as mp
+from models.agent_grpo import Agent_GRPO
+from config import *
+import custom_env
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    return parser.parse_args()
+
+
+def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    weights_path = os.path.join(save_dir, 'weights.pth')
+    param_queue = manager.Queue(maxsize=num_processes)
+    stop_event = manager.Event()
+    global_episode = Value('i', 0);
+    global_step = Value('i', 0)
+    episode_lock = manager.Lock();
+    save_lock = manager.Lock()
+    rewards_log = manager.list()
+
+    processes = []
+    for pid in range(num_processes):
+        p = mp.Process(target=sample_worker, args=(
+        env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue, stop_event,
+        max_t, save_lock, rewards_log))
+        p.start();
+        processes.append(p)
+
+    initial_state_dict = agent.get_state_dict()
+    for _ in range(num_processes): param_queue.put(initial_state_dict)
+
+    last_log_time, update_count = time.time(), 0
+    try:
+        while global_episode.value < total_episodes:
+            if len(agent.memory) >= 2048:
+                with save_lock:
+                    agent.learn(global_step.value);
+                    update_count += 1
+                    if time.time() - last_log_time > 5:
+                        print(f"[GRPO] Upd {update_count} | Beta {agent.beta:.3f} | Ent {agent.entropy:.3f}")
+                        last_log_time = time.time()
+                    if update_count % 5 == 0:
+                        torch.save(agent.actor.state_dict(), weights_path)
+                        np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+                new_state_dict = agent.get_state_dict()
+                while not param_queue.empty(): param_queue.get()
+                for _ in range(num_processes): param_queue.put(new_state_dict)
+            time.sleep(0.1)
+    finally:
+        stop_event.set();
+        [p.join() for p in processes]
+
+    torch.save(agent.actor.state_dict(), weights_path)
+    np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+
+
+def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+                  stop_event, max_t, save_lock, rewards_log):
+    env = gym.make(env_id)
+    # 自动获取维度
+    state_dim = int(np.prod(env.observation_space.shape))
+    local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
+                             GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                             manager=None, is_worker=True)
+    try:
+        local_agent.load_state_dict(param_queue.get(timeout=5))
+    except:
+        pass
+
+    while not stop_event.is_set():
+        with episode_lock:
+            if global_episode.value >= total_episodes: break
+            global_episode.value += 1
+            ep = global_episode.value
+        state = env.reset()
+        if isinstance(state, tuple): state = state[0]
+        state = state.flatten()
+        ep_reward, steps = 0, 0;
+        done = False
+        while not done and steps < max_t:
+            with global_step.get_lock():
+                global_step.value += 1
+            steps += 1
+            state_tensor = torch.FloatTensor(state).to(local_agent.device)
+            action, log_prob = local_agent.act(state_tensor)
+            res = env.step(action)
+            if len(res) == 5:
+                next_state, reward, term, trunc, _ = res
+            else:
+                next_state, reward, done, _ = res
+            done = term or trunc if len(res) == 5 else done
+            next_state = next_state.flatten()
+            shared_memory.remember((state, action, reward, next_state, done, log_prob))
+            state = next_state.copy()
+            ep_reward += reward
+            if not param_queue.empty():
+                try:
+                    local_agent.load_state_dict(param_queue.get_nowait())
+                except:
+                    pass
+        with save_lock:
+            rewards_log.append(ep_reward)
+        if pid == 0: print(f'\rEp {ep} Rew {ep_reward:.1f}', end='')
+    env.close()
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    args = parse_args()
+    set_seed(args.seed)
+    save_dir = f'results/grpo_main/seed_{args.seed}'
+    with mp.Manager() as manager:
+        dummy = gym.make(RAM_ENV_NAME)
+        state_dim = int(np.prod(dummy.observation_space.shape))
+        act_dim = dummy.action_space.n
+        dummy.close()
+        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
+                           LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                           manager=manager, is_worker=False)
+        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
