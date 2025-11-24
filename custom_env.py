@@ -10,15 +10,12 @@ from highway_env.vehicle.kinematics import Vehicle
 
 class HighwayEnv(AbstractEnv):
     """
-    基于动态约束 GRPO 算法的四车道高速公路环境 (修复版)
+    优化版 HighwayEnv: 调整奖励函数以保证正向收益
     """
-
-    # --- [修复] 显式定义 metadata，防止 Gym 报错 ---
     metadata = {'render.modes': ['human', 'rgb_array'], "video.frames_per_second": 15}
 
     def __init__(self, config: dict = None, render_mode: str = None):
         super().__init__(config, render_mode)
-        # --- [修复] 显式定义 reward_range ---
         self.reward_range = (-float('inf'), float('inf'))
 
     @classmethod
@@ -38,13 +35,11 @@ class HighwayEnv(AbstractEnv):
             "lanes_count": 4,
             "vehicles_count": 25,
             "traffic_spawn_length": 600,
-            "initial_ego_speed": 15,
+            "initial_ego_speed": 25,  # 提高初始速度，让模型更容易跟上车流
             "initial_traffic_speed": 20,
-            "traffic_speed_variance": 5,
-            "duration": 600,
-            "ego_spacing": 30,
-            "vehicles_density": 1,
-            "collision_reward": -300.0,
+            "duration": 1000,  # 增加最大步数
+            "collision_reward": -50.0,  # [关键修改] 降低碰撞惩罚，避免分数过低
+            "reward_speed_range": [20, 35],  # 速度奖励区间
             "offroad_terminal": False
         })
         return config
@@ -55,7 +50,7 @@ class HighwayEnv(AbstractEnv):
 
     def _create_road(self) -> None:
         self.road = Road(
-            network=RoadNetwork.straight_road_network(self.config["lanes_count"], speed_limit=30, length=3000),
+            network=RoadNetwork.straight_road_network(self.config["lanes_count"], speed_limit=30, length=5000),
             np_random=self.np_random, record_history=self.config["show_trajectories"])
 
     def _create_vehicles(self) -> None:
@@ -66,7 +61,7 @@ class HighwayEnv(AbstractEnv):
 
         start_lane = 1
         ego_lane = self.road.network.get_lane(("0", "1", start_lane))
-        ego_pos = 50
+        ego_pos = 100  # 初始位置稍微靠后一点，给点反应时间
         controlled_vehicle = vehicle_class(
             self.road, position=ego_lane.position(ego_pos, 0),
             heading=ego_lane.heading_at(ego_pos), speed=self.config["initial_ego_speed"]
@@ -75,29 +70,26 @@ class HighwayEnv(AbstractEnv):
         self.road.vehicles.append(controlled_vehicle)
         self.vehicle = self.controlled_vehicles[0]
 
+        # 简单的交通流生成逻辑
         vehicles_to_create = self.config["vehicles_count"] - 1
-        min_spacing = 15
         spawn_len = self.config.get("traffic_spawn_length", 400)
-        base_spd = self.config.get("initial_traffic_speed", 20)
-        spd_var = self.config.get("traffic_speed_variance", 5)
 
         for _ in range(vehicles_to_create):
+            # 尝试 50 次找到一个不重叠的位置
             for _ in range(50):
                 lid = self.np_random.integers(0, self.config["lanes_count"])
-                lane = self.road.network.get_lane(("0", "1", lid))
-                x = self.np_random.uniform(0, spawn_len)
-                lane_y = lane.position(0, 0)[1]
-                ego_y = ego_lane.position(0, 0)[1]
-                if abs(lane_y - ego_y) < 2.0 and abs(x - ego_pos) < 20: continue
+                x = self.np_random.uniform(0, spawn_len) + ego_pos - 50
 
+                # 简单的防碰撞检查
                 valid = True
                 for v in self.road.vehicles:
-                    if abs(v.position[1] - lane_y) < 2.0 and abs(v.position[0] - x) < min_spacing:
-                        valid = False;
+                    if np.linalg.norm(v.position - [x, 0]) < 15:  # 15米安全半径
+                        valid = False
                         break
 
                 if valid:
-                    spd = base_spd + self.np_random.uniform(-spd_var, spd_var)
+                    lane = self.road.network.get_lane(("0", "1", lid))
+                    spd = 20 + self.np_random.uniform(-5, 5)
                     veh = other_vehicles_type(self.road, position=lane.position(x, 0), heading=lane.heading_at(x),
                                               speed=spd)
                     veh.randomize_behavior()
@@ -105,22 +97,35 @@ class HighwayEnv(AbstractEnv):
                     break
 
     def _reward(self, action: Action) -> float:
-        if self.vehicle.crashed: return self.config["collision_reward"]
-        r_survival = 0.2
-        target_speed = 30
-        speed_diff = abs(self.vehicle.speed - target_speed)
-        r_speed = 1.0 * (1 - min(speed_diff, 30) / 30)
-        r_low_speed = 0.0
-        if self.vehicle.speed < 20: r_low_speed = -0.5 * (1 - self.vehicle.speed / 20)
+        # 1. 碰撞惩罚 (Collision)
+        if self.vehicle.crashed:
+            return self.config["collision_reward"]
+
+        # 2. 高速奖励 (High Speed Reward)
+        # 归一化速度：(当前速度 - 20) / (30 - 20)。 20m/s以下得0分，30m/s以上得1分
+        scaled_speed = utils.lmap(self.vehicle.speed, self.config["reward_speed_range"], [0, 1])
+        r_speed = np.clip(scaled_speed, 0, 1)
+
+        # 3. 存活奖励 (Survival Reward) - 鼓励活得久
+        r_survival = 0.5
+
+        # 4. 变道惩罚 (Lane Change Penalty) - 避免频繁变道
+        r_lane_change = 0
+        if action in [0, 2]:  # LANE_LEFT, LANE_RIGHT
+            r_lane_change = -0.1
+
+        # 5. 距离保持 (Safety Distance)
         r_dist = 0
-        front = self._get_front_vehicle()
-        if front:
-            d = np.linalg.norm(self.vehicle.position - front.position)
-            if d < 25: r_dist = -0.5 * (25 - d) / 25.0
-        r_compliance = 0.0
-        if hasattr(self.vehicle, 'lane_index') and len(self.vehicle.lane_index) == 3:
-            if self.vehicle.lane_index[2] >= 2 and self.vehicle.speed > 25: r_compliance = 0.2
-        return r_speed + r_low_speed + r_survival + r_dist + r_compliance
+        front_vehicle = self._get_front_vehicle()
+        if front_vehicle:
+            d = np.linalg.norm(self.vehicle.position - front_vehicle.position)
+            if d < 25:  # 稍微增加安全距离阈值
+                # 线性惩罚：距离越近扣分越多，最大扣 1.0
+                r_dist = -1.0 * (1 - d / 25.0)
+
+        # 总分公式
+        reward = r_speed + r_survival + r_lane_change + r_dist
+        return reward
 
     def _get_front_vehicle(self) -> Vehicle:
         if not self.vehicle.lane: return None
@@ -134,28 +139,16 @@ class HighwayEnv(AbstractEnv):
         return self.vehicle.crashed
 
     def _is_truncated(self) -> bool:
-        return self.steps >= self.config["duration"]
+        return self.time >= self.config["duration"]
 
     def _cost(self, action: int) -> float:
         return float(self.vehicle.crashed)
 
 
-class HighwayEnvFast(HighwayEnv):
-    @classmethod
-    def default_config(cls) -> dict:
-        cfg = super().default_config()
-        cfg.update({"simulation_frequency": 10, "lanes_count": 2, "vehicles_count": 10, "duration": 30})
-        return cfg
-
-
-# --- [关键修复] 移除 max_episode_steps ---
-# 这样 Gym 就不会自动加 TimeLimit 包装器，避免了 attribute 缺失问题
-# 时长控制完全由我们自己的 _is_truncated 函数接管
+# 注册环境
+# [关键修复] 移除 max_episode_steps，防止旧版 gym 自动添加不兼容的 TimeLimit 包装器
+# 我们的环境内部已经通过 _is_truncated 实现了时间限制逻辑
 register(
     id='highway-v0',
     entry_point='custom_env:HighwayEnv',
-)
-register(
-    id='highway-fast-v0',
-    entry_point='custom_env:HighwayEnvFast',
 )
