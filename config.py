@@ -11,8 +11,8 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 RAM_ENV_NAME = 'highway-v0'
 
 # 训练参数
-NUM_PROCESSES = 10        # 多进程数量
-BATCH_SIZE = 256
+NUM_PROCESSES = 30        # 多进程数量
+BATCH_SIZE = 512
 LEARNING_RATE = 0.0003
 
 # 衰减参数
