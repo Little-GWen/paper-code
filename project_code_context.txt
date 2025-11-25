@@ -1,0 +1,1766 @@
+
+====================
+FILE: ./config.py
+====================
+import torch
+import numpy as np
+import random
+import os
+
+# 设备配置
+GPU = 0
+DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "cpu")
+
+# 环境名
+RAM_ENV_NAME = 'highway-v0'
+
+# 训练参数
+# [优化] 增大 Batch Size 以稳定梯度估计
+NUM_PROCESSES = 30
+BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
+LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
+
+# 衰减参数
+DECAY_RATE = 0.999
+DECAY_STEP_SIZE = 50000
+
+# 算法通用参数
+GAMMA = 0.99
+TAU = 0.001
+
+# PPO/GRPO 特有参数
+LAMDA = 0.95
+EPS_CLIP = 0.2           # 原 0.3，稍微保守一点
+K_EPOCHS = 10            # 原 6，数据利用率稍微提高
+CRITIC_LOSS_COEF = 0.5
+ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
+
+# 训练时长
+RAM_NUM_EPISODE = 50000  # 稍微增加总轮次
+MAX_T = 1000
+
+# 可视化参数
+VISUAL_NUM_EPISODE = 3000
+
+# --- 全局随机种子设置函数 ---
+def set_seed(seed):
+    if seed is None: return
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    print(f"✅ Global Seed set to: {seed}")
+
+====================
+FILE: ./export_code.py
+====================
+import os
+
+# 设置要忽略的文件夹（比如虚拟环境、git目录、结果文件夹）
+IGNORE_DIRS = {'.git', '__pycache__', 'results', 'venv', '.idea', '.vscode'}
+# 设置输出文件名
+OUTPUT_FILE = 'project_code_context.txt'
+
+
+def merge_files():
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as outfile:
+        # 遍历当前目录
+        for root, dirs, files in os.walk("."):
+            # 过滤掉不需要的目录
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+
+            for file in files:
+                if file.endswith(".py"):
+                    file_path = os.path.join(root, file)
+                    # 写入分隔符和文件名，方便AI识别
+                    outfile.write(f"\n{'=' * 20}\nFILE: {file_path}\n{'=' * 20}\n")
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            outfile.write(infile.read())
+                    except Exception as e:
+                        outfile.write(f"# Error reading file: {e}")
+                    outfile.write("\n")
+
+    print(f"完成！所有代码已合并到 {OUTPUT_FILE}，请将该文件发送给AI。")
+
+
+if __name__ == "__main__":
+    merge_files()
+
+====================
+FILE: ./run_all_seeds.py
+====================
+import os
+import subprocess
+import time
+
+# --- 实验配置 ---
+# 为了发论文，建议跑 3 个种子以画出阴影图。
+# 如果只是想快速测试代码是否报错，可以临时改为 [0]
+SEEDS = [0]
+
+ALGORITHMS = [
+    # 1. GRPO 主模型 (Ours)
+    ("experiments/train_grpo.py", "GRPO (Ours)"),
+
+    # 2. PPO 基线 (Baseline)
+    ("experiments/train_ppo.py", "PPO (Baseline)"),
+
+    # 3. DQN 基线 (Baseline) - [已开启]
+    ("experiments/train_dqn.py", "DQN (Baseline)"),
+
+    # 4. GRPO 消融实验 (Ablation) - [已开启]
+    ("experiments/train_grpo_ablation.py", "GRPO (Ablation)")
+]
+
+
+def run():
+    print(f"🚀 开始全量实验! 总共 {len(ALGORITHMS)} 个算法, 每个跑 {len(SEEDS)} 个种子。")
+    print("⚠️ 警告：全量运行时间较长，请确保电源连接，不要让电脑休眠。\n")
+
+    start_all = time.time()
+
+    for script_path, algo_name in ALGORITHMS:
+        for seed in SEEDS:
+            print(f"{'=' * 60}")
+            print(f"▶️  正在运行: {algo_name} | Seed: {seed}")
+            print(f"   Command: python {script_path} --seed {seed}")
+            print(f"{'=' * 60}\n")
+
+            algo_start = time.time()
+
+            try:
+                # check=True: 遇到报错立即停止，方便你修 Bug
+                subprocess.run(["python", script_path, "--seed", str(seed)], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ 实验失败: {algo_name} (Seed {seed})")
+                print(f"错误信息: {e}")
+                # 这里选择 continue，即使 DQN 挂了，也不影响其他算法继续跑
+                continue
+            except KeyboardInterrupt:
+                print("\n🛑 用户手动停止实验。")
+                return
+
+            duration = (time.time() - algo_start) / 60
+            print(f"\n✅ {algo_name} (Seed {seed}) 完成! 耗时: {duration:.2f} 分钟\n")
+
+    total_duration = (time.time() - start_all) / 3600
+    print(f"🎉 所有实验已完成！总耗时: {total_duration:.2f} 小时。")
+    print("请运行 analysis/plot_learning_curves.py 查看最终对比图。")
+
+
+if __name__ == "__main__":
+    run()
+
+====================
+FILE: ./custom_env.py
+====================
+import numpy as np
+from gym.envs.registration import register
+from highway_env import utils
+from highway_env.envs.common.abstract import AbstractEnv
+from highway_env.envs.common.action import Action
+from highway_env.road.road import Road, RoadNetwork
+from highway_env.vehicle.controller import ControlledVehicle
+from highway_env.vehicle.kinematics import Vehicle
+
+class HighwayEnv(AbstractEnv):
+    """
+    优化版 HighwayEnv:
+    1. 修正 Observation 顺序为 Fixed，确保 Agent 能正确识别 Ego Vehicle。
+    2. 调整奖励函数，避免 Early Stopping 问题。
+    """
+    metadata = {'render.modes': ['human', 'rgb_array'], "video.frames_per_second": 15}
+
+    def __init__(self, config: dict = None, render_mode: str = None):
+        super().__init__(config, render_mode)
+        self.reward_range = (-float('inf'), float('inf'))
+
+    @classmethod
+    def default_config(cls) -> dict:
+        config = super().default_config()
+        config.update({
+            "observation": {
+                "type": "Kinematics",
+                "vehicles_count": 15,
+                "features": ["x", "y", "vx", "vy", "heading"],
+                "features_range": {
+                    "x": [-100, 100], "y": [-100, 100], "vx": [-20, 20], "vy": [-20, 20]
+                },
+                "absolute": False,
+                # [关键修正] 改为 fixed，保证 obs[0] 永远是 Ego Vehicle
+                # 这样 models/agent_grpo.py 里的 calculate_risk 才能算对
+                "order": "fixed"
+            },
+            "action": {"type": "DiscreteMetaAction"},
+            "lanes_count": 4,
+            "vehicles_count": 25,
+            "traffic_spawn_length": 600,
+            "initial_ego_speed": 25,
+            "initial_traffic_speed": 20,
+            "duration": 1000,
+            # [关键修正] 奖励调整
+            "collision_reward": -15.0,  # 原 -50，太重了会导致模型不敢动
+            "reward_speed_range": [20, 35],
+            "offroad_terminal": False
+        })
+        return config
+
+    def _reset(self) -> None:
+        self._create_road()
+        self._create_vehicles()
+
+    def _create_road(self) -> None:
+        self.road = Road(
+            network=RoadNetwork.straight_road_network(self.config["lanes_count"], speed_limit=30, length=5000),
+            np_random=self.np_random, record_history=self.config["show_trajectories"])
+
+    def _create_vehicles(self) -> None:
+        other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+        self.controlled_vehicles = []
+        vehicle_class = self.action_type.vehicle_class
+        if hasattr(vehicle_class, 'func'): vehicle_class = vehicle_class.func
+
+        start_lane = 1
+        ego_lane = self.road.network.get_lane(("0", "1", start_lane))
+        ego_pos = 100
+        controlled_vehicle = vehicle_class(
+            self.road, position=ego_lane.position(ego_pos, 0),
+            heading=ego_lane.heading_at(ego_pos), speed=self.config["initial_ego_speed"]
+        )
+        self.controlled_vehicles.append(controlled_vehicle)
+        self.road.vehicles.append(controlled_vehicle)
+        self.vehicle = self.controlled_vehicles[0]
+
+        vehicles_to_create = self.config["vehicles_count"] - 1
+        spawn_len = self.config.get("traffic_spawn_length", 400)
+
+        for _ in range(vehicles_to_create):
+            for _ in range(50):
+                lid = self.np_random.integers(0, self.config["lanes_count"])
+                x = self.np_random.uniform(0, spawn_len) + ego_pos - 50
+                valid = True
+                for v in self.road.vehicles:
+                    if np.linalg.norm(v.position - [x, 0]) < 15:
+                        valid = False
+                        break
+                if valid:
+                    lane = self.road.network.get_lane(("0", "1", lid))
+                    spd = 20 + self.np_random.uniform(-5, 5)
+                    veh = other_vehicles_type(self.road, position=lane.position(x, 0), heading=lane.heading_at(x),
+                                              speed=spd)
+                    veh.randomize_behavior()
+                    self.road.vehicles.append(veh)
+                    break
+
+    def _reward(self, action: Action) -> float:
+        # 1. 碰撞惩罚
+        if self.vehicle.crashed:
+            return self.config["collision_reward"]
+
+        # 2. 高速奖励 (放大权重)
+        scaled_speed = utils.lmap(self.vehicle.speed, self.config["reward_speed_range"], [0, 1])
+        r_speed = np.clip(scaled_speed, 0, 1) * 2.0  # 满速得 2 分
+
+        # 3. 存活奖励 (放大权重)
+        r_survival = 1.0  # 只要活着就一直加分
+
+        # 4. 变道惩罚
+        r_lane_change = 0
+        if action in [0, 2]:
+            r_lane_change = -0.1
+
+        # 5. 距离保持
+        r_dist = 0
+        front_vehicle = self._get_front_vehicle()
+        if front_vehicle:
+            d = np.linalg.norm(self.vehicle.position - front_vehicle.position)
+            if d < 25:
+                # 距离越近扣分越多，最大扣 1.0
+                r_dist = -1.0 * (1 - d / 25.0)
+
+        return r_speed + r_survival + r_lane_change + r_dist
+
+    def _get_front_vehicle(self) -> Vehicle:
+        if not self.vehicle.lane: return None
+        ego_lane = self.vehicle.lane_index
+        fronts = [v for v in self.road.vehicles if
+                  v is not self.vehicle and v.lane_index == ego_lane and v.position[0] > self.vehicle.position[0]]
+        if fronts: return min(fronts, key=lambda v: v.position[0] - self.vehicle.position[0])
+        return None
+
+    def _is_terminated(self) -> bool:
+        return self.vehicle.crashed
+
+    def _is_truncated(self) -> bool:
+        return self.time >= self.config["duration"]
+
+    def _cost(self, action: int) -> float:
+        return float(self.vehicle.crashed)
+
+register(
+    id='highway-v0',
+    entry_point='custom_env:HighwayEnv',
+)
+
+====================
+FILE: ./analysis/plot_learning_curves.py
+====================
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import pandas as pd
+import seaborn as sns
+
+RESULTS_DIR = '../results'
+
+
+def get_data(algo_folder):
+    path = os.path.join(RESULTS_DIR, algo_folder)
+    if not os.path.exists(path):
+        print(f"⚠️  文件夹未找到 (跳过): {path}")
+        return None
+
+    all_data = []
+    min_len = float('inf')
+
+    # 遍历所有种子文件夹 seed_0, seed_1 ...
+    seed_folders = [d for d in os.listdir(path) if d.startswith('seed_')]
+
+    if not seed_folders:
+        print(f"⚠️  {algo_folder} 下没有找到 seed_X 文件夹")
+        return None
+
+    for seed_folder in seed_folders:
+        file_path = os.path.join(path, seed_folder, 'rewards.npy')
+        if os.path.exists(file_path):
+            try:
+                rewards = np.load(file_path)
+                # 数据平滑 (Smoothing)
+                rewards = pd.Series(rewards).rolling(window=50, min_periods=1).mean().values
+                all_data.append(rewards)
+                if len(rewards) < min_len: min_len = len(rewards)
+            except:
+                print(f"❌ 读取错误: {file_path}")
+
+    if not all_data: return None
+
+    # 截断到最小长度，保证矩阵整齐
+    data_matrix = np.array([d[:min_len] for d in all_data])
+
+    # 转换为 DataFrame
+    df = pd.DataFrame(data_matrix).melt()
+    df.columns = ['Episode', 'Reward']
+    return df
+
+
+def plot_all():
+    plt.figure(figsize=(10, 6))
+    sns.set_theme(style="whitegrid")
+
+    # 定义要画的算法 (Label名称 : 文件夹名称)
+    exps = {
+        'GRPO (Ours)': 'grpo_main',  # 红色 (默认第一色)
+        'PPO (Baseline)': 'ppo',  # 蓝色
+        'GRPO (No Dynamic Beta)': 'grpo_no_dynamic',  # 绿色/橙色 (消融)
+        #'DQN (Baseline)': 'dqn'  # 紫色/其他
+    }
+
+    # 自动分配颜色，或者你可以手动指定 palette
+    # palette = {'GRPO (Ours)': 'red', ...}
+
+    plotted_count = 0
+    for label, folder in exps.items():
+        df = get_data(folder)
+        if df is not None:
+            sns.lineplot(data=df, x='Episode', y='Reward', label=label, linewidth=2.5)
+            plotted_count += 1
+
+    if plotted_count == 0:
+        print("❌ 没有找到任何数据，请先运行 run_experiments.py")
+        return
+
+    plt.title("Training Performance Comparison (4-Lane High Density)", fontsize=15, fontweight='bold')
+    plt.xlabel("Training Episodes", fontsize=12)
+    plt.ylabel("Average Reward", fontsize=12)
+    plt.legend(fontsize=11, loc='lower right')
+    plt.tight_layout()
+
+    save_path = "learning_curve_full.png"
+    plt.savefig(save_path, dpi=300)
+    print(f"\n✅ 图表已保存至 analysis/{save_path}")
+    print("打开它看看你的论文核心结果吧！")
+    plt.show()
+
+
+if __name__ == "__main__":
+    plot_all()
+
+====================
+FILE: ./analysis/analyze_convergence.py
+====================
+import numpy as np
+import os
+
+DATA_DIR = '../results'
+
+
+def analyze(algo_folder, name):
+    path = os.path.join(DATA_DIR, algo_folder)
+    if not os.path.exists(path): return
+    scores = []
+    for seed in os.listdir(path):
+        if seed.startswith('seed_'):
+            f = os.path.join(path, seed, 'rewards.npy')
+            if os.path.exists(f):
+                data = np.load(f)
+                scores.append(np.mean(data[-500:]))
+
+    if scores:
+        print(f"--- {name} ---")
+        print(f"Final Reward (Mean ± Std): {np.mean(scores):.2f} ± {np.std(scores):.2f}")
+
+
+if __name__ == "__main__":
+    analyze('ppo', 'PPO')
+    analyze('grpo_main', 'GRPO')
+    analyze('grpo_no_dynamic', 'GRPO (Ablation)')
+
+====================
+FILE: ./experiments/train_dqn.py
+====================
+import sys, os, argparse
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+from multiprocessing import Manager
+import gym, torch
+from models.agent_dqn import Agent_DQN
+from config import *
+import custom_env
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    return parser.parse_args()
+
+
+def main_optimizer(env_id, num_episodes, agent, save_dir):
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    weights_path = os.path.join(save_dir, 'weights.pth')
+    env = gym.make(env_id)
+
+    # 日志列表
+    rewards_log = []
+    speed_log = []
+    collision_log = []
+
+    print(f"🚀 DQN Training Started! Episodes: {num_episodes}")
+
+    for i in range(num_episodes):
+        state = env.reset()
+        if isinstance(state, tuple): state = state[0]
+        state = state.flatten()
+        ep_reward, steps, done = 0, 0, False
+        ep_speed = 0
+        is_crashed = 0
+
+        while not done and steps < MAX_T:
+            action, _ = agent.act(state)
+            res = env.step(action)
+            if len(res) == 5:
+                next_state, reward, term, trunc, info = res
+            else:
+                next_state, reward, done, info = res
+            done = term or trunc if len(res) == 5 else done
+
+            if len(state) >= 3: ep_speed += state[2]
+            if info.get('crashed', False): is_crashed = 1
+
+            next_state = next_state.flatten()
+            agent.memory.remember((state, action, reward, next_state, done, 0))
+            if steps % 10 == 0: agent.learn()
+
+            state = next_state
+            ep_reward += reward
+            steps += 1
+
+        rewards_log.append(ep_reward)
+        speed_log.append(ep_speed / max(1, steps))
+        collision_log.append(is_crashed)
+
+        if i % 10 == 0: print(f"\rEp {i}/{num_episodes} Reward {ep_reward:.1f} Eps {agent.epsilon:.2f}", end='')
+        if i % 50 == 0:
+            torch.save(agent.q_net.state_dict(), weights_path)
+            np.save(os.path.join(save_dir, 'rewards.npy'), rewards_log)
+            np.save(os.path.join(save_dir, 'speed.npy'), speed_log)
+            np.save(os.path.join(save_dir, 'collision.npy'), collision_log)
+
+    torch.save(agent.q_net.state_dict(), weights_path)
+    np.save(os.path.join(save_dir, 'rewards.npy'), rewards_log)
+    np.save(os.path.join(save_dir, 'speed.npy'), speed_log)
+    np.save(os.path.join(save_dir, 'collision.npy'), collision_log)
+    print(f"\nDQN Finished! Saved to {save_dir}")
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    set_seed(args.seed)
+    save_dir = f'results/dqn/seed_{args.seed}'
+    with Manager() as manager:
+        dummy = gym.make(RAM_ENV_NAME)
+        state_dim = int(np.prod(dummy.observation_space.shape))
+        act_dim = dummy.action_space.n
+        dummy.close()
+        agent = Agent_DQN(state_dim, act_dim, 64, 5e-4, 0.99, 1.0, 0.05, 0.995, DEVICE, manager)
+        main_optimizer(RAM_ENV_NAME, RAM_NUM_EPISODE // 4, agent, save_dir)
+
+====================
+FILE: ./experiments/train_ppo.py
+====================
+import sys, os, argparse
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+from multiprocessing import Process, Manager, Value, Lock
+import gym, torch, time
+import torch.multiprocessing as mp
+from models.agent_ppo import Agent_PPO
+from config import *
+import custom_env
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    return parser.parse_args()
+
+
+def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    weights_path = os.path.join(save_dir, 'weights.pth')
+    param_queue = manager.Queue(maxsize=num_processes)
+    stop_event = manager.Event()
+    global_episode = Value('i', 0);
+    global_step = Value('i', 0)
+    episode_lock = manager.Lock();
+    save_lock = manager.Lock()
+
+    rewards_log = manager.list()
+    speed_log = manager.list()
+    collision_log = manager.list()
+
+    processes = []
+    for pid in range(num_processes):
+        p = mp.Process(target=sample_worker, args=(
+        env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue, stop_event,
+        max_t, save_lock, rewards_log, speed_log, collision_log))
+        p.start();
+        processes.append(p)
+
+    initial_state_dict = agent.get_state_dict()
+    for _ in range(num_processes): param_queue.put(initial_state_dict)
+
+    last_log_time, update_count = time.time(), 0
+    try:
+        while global_episode.value < total_episodes:
+            if len(agent.memory) >= 2048:
+                with save_lock:
+                    agent.learn(global_step.value);
+                    update_count += 1
+                    if time.time() - last_log_time > 5:
+                        print(f"[PPO] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f}")
+                        last_log_time = time.time()
+                    if update_count % 5 == 0:
+                        torch.save(agent.actor.state_dict(), weights_path)
+                        np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+                        np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+                        np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+                new_state_dict = agent.get_state_dict()
+                while not param_queue.empty(): param_queue.get()
+                for _ in range(num_processes): param_queue.put(new_state_dict)
+            time.sleep(0.1)
+    finally:
+        stop_event.set();
+        [p.join() for p in processes]
+
+    torch.save(agent.actor.state_dict(), weights_path)
+    np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+    np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+    np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+
+
+def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+                  stop_event, max_t, save_lock, rewards_log, speed_log, collision_log):
+    env = gym.make(env_id)
+    state_dim = int(np.prod(env.observation_space.shape))
+    local_agent = Agent_PPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
+                            GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                            manager=None, is_worker=True)
+    try:
+        local_agent.load_state_dict(param_queue.get(timeout=5))
+    except:
+        pass
+
+    while not stop_event.is_set():
+        with episode_lock:
+            if global_episode.value >= total_episodes: break
+            global_episode.value += 1
+            ep = global_episode.value
+        state = env.reset()
+        if isinstance(state, tuple): state = state[0]
+        state = state.flatten()
+        ep_reward, ep_speed, steps = 0, 0, 0;
+        done = False
+        is_crashed = 0
+        while not done and steps < max_t:
+            with global_step.get_lock():
+                global_step.value += 1
+            steps += 1
+            if len(state) >= 3: ep_speed += state[2]
+            state_tensor = torch.FloatTensor(state).to(local_agent.device)
+            action, log_prob = local_agent.act(state_tensor)
+            res = env.step(action)
+            if len(res) == 5:
+                next_state, reward, term, trunc, info = res
+            else:
+                next_state, reward, done, info = res
+            done = term or trunc if len(res) == 5 else done
+
+            if info.get('crashed', False): is_crashed = 1
+
+            next_state = next_state.flatten()
+            shared_memory.remember((state, action, reward, next_state, done, log_prob))
+            state = next_state.copy()
+            ep_reward += reward
+            if not param_queue.empty():
+                try:
+                    local_agent.load_state_dict(param_queue.get_nowait())
+                except:
+                    pass
+        with save_lock:
+            rewards_log.append(ep_reward)
+            speed_log.append(ep_speed / max(1, steps))
+            collision_log.append(is_crashed)
+        if pid == 0: print(f'\rEp {ep} Rew {ep_reward:.1f}', end='')
+    env.close()
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    args = parse_args()
+    set_seed(args.seed)
+    save_dir = f'results/ppo/seed_{args.seed}'
+    with mp.Manager() as manager:
+        dummy = gym.make(RAM_ENV_NAME)
+        state_dim = int(np.prod(dummy.observation_space.shape))
+        act_dim = dummy.action_space.n
+        dummy.close()
+        agent = Agent_PPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA, LAMDA,
+                          EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False, manager=manager,
+                          is_worker=False)
+        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+
+====================
+FILE: ./experiments/train_grpo.py
+====================
+import sys, os, argparse
+import time
+import random
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+from multiprocessing import Process, Manager, Value, Lock
+import gym, torch
+import torch.multiprocessing as mp
+from models.agent_grpo import Agent_GRPO
+from config import *
+import custom_env
+
+# 组大小 (Sample G trajectories for same state)
+GROUP_SIZE = 4
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    return parser.parse_args()
+
+
+def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    weights_path = os.path.join(save_dir, 'weights.pth')
+    param_queue = manager.Queue(maxsize=num_processes)
+    stop_event = manager.Event()
+    global_episode = Value('i', 0)
+    global_step = Value('i', 0)
+    episode_lock = manager.Lock()
+    save_lock = manager.Lock()
+
+    rewards_log = manager.list()
+    speed_log = manager.list()
+    collision_log = manager.list()
+
+    processes = []
+    for pid in range(num_processes):
+        # [主实验] 默认 use_dynamic_beta=True (在 Agent 初始化中设置)
+        p = mp.Process(target=sample_worker, args=(
+            env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+            stop_event, max_t, save_lock, rewards_log, speed_log, collision_log))
+        p.start()
+        processes.append(p)
+
+    initial_state_dict = agent.get_state_dict()
+    for _ in range(num_processes): param_queue.put(initial_state_dict)
+
+    last_log_time, update_count = time.time(), 0
+    try:
+        while global_episode.value < total_episodes:
+            # 等待足够的数据 (Batch Size * Group Size 确保可以进行几次完整的组更新)
+            if len(agent.memory) >= BATCH_SIZE * 4:
+                with save_lock:
+                    agent.learn(global_step.value)
+                    update_count += 1
+                    if time.time() - last_log_time > 5:
+                        print(f"[GRPO-Main] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f}")
+                        last_log_time = time.time()
+                    if update_count % 5 == 0:
+                        torch.save(agent.actor.state_dict(), weights_path)
+                        np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+                        np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+                        np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+
+                new_state_dict = agent.get_state_dict()
+                # 清空旧参数，广播新参数
+                while not param_queue.empty():
+                    try:
+                        param_queue.get_nowait()
+                    except:
+                        pass
+                for _ in range(num_processes): param_queue.put(new_state_dict)
+            time.sleep(0.1)
+    finally:
+        stop_event.set()
+        [p.join() for p in processes]
+
+    torch.save(agent.actor.state_dict(), weights_path)
+    np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+    np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+    np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+
+
+def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+                  stop_event, max_t, save_lock, rewards_log, speed_log, collision_log):
+    env = gym.make(env_id)
+    state_dim = int(np.prod(env.observation_space.shape))
+
+    # [主实验] use_dynamic_beta=True
+    local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
+                             GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                             manager=None, is_worker=True, use_dynamic_beta=True)
+    try:
+        local_agent.load_state_dict(param_queue.get(timeout=5))
+    except:
+        pass
+
+    while not stop_event.is_set():
+        # 1. 组采样初始化 (Same-State Logic)
+        group_seed = random.randint(0, 1000000)
+        group_trajectories = []  # 存储轨迹数据
+        group_returns = []  # 存储每条轨迹的 Return
+
+        # 2. 采集 Group 轨迹
+        for _ in range(GROUP_SIZE):
+            # 强制使用相同的种子重置环境
+            state, _ = env.reset(seed=group_seed)
+            state = state.flatten()
+            ep_reward, ep_speed, steps = 0, 0, 0
+            done = False
+            is_crashed = 0
+
+            traj_buffer = []
+
+            while not done and steps < max_t:
+                state_tensor = torch.FloatTensor(state).to(local_agent.device)
+                action, log_prob = local_agent.act(state_tensor)
+
+                res = env.step(action)
+                if len(res) == 5:
+                    next_state, reward, term, trunc, info = res
+                else:
+                    next_state, reward, done, info = res
+                done = term or trunc if len(res) == 5 else done
+
+                if info.get('crashed', False): is_crashed = 1
+                if len(state) >= 3: ep_speed += state[2]
+
+                next_state = next_state.flatten()
+                traj_buffer.append((state, action, reward, next_state, done, log_prob))
+                state = next_state.copy()
+                ep_reward += reward
+                steps += 1
+
+            # 计算该条轨迹的 Monte-Carlo Return
+            G = 0
+            traj_with_G = []
+            for t in reversed(range(len(traj_buffer))):
+                s, a, r, ns, d, lp = traj_buffer[t]
+                G = r + GAMMA * G
+                traj_with_G.insert(0, (s, a, r, ns, d, lp, G))
+
+            group_trajectories.append(traj_with_G)
+            group_returns.append(G)
+
+            with global_step.get_lock():
+                global_step.value += steps
+
+        # 3. 组内归一化 (GRPO 核心步骤)
+        # 计算这一组内的 Mean 和 Std
+        group_returns_arr = np.array(group_returns)
+        group_mean = group_returns_arr.mean()
+        group_std = group_returns_arr.std() + 1e-8
+
+        # 计算相对优势 (Advantage)
+        normalized_advantages = (group_returns_arr - group_mean) / group_std
+
+        # 4. 存入 Buffer (用 Advantage 替换 Reward)
+        for i, traj in enumerate(group_trajectories):
+            group_adv = normalized_advantages[i]
+            for step_data in traj:
+                s, a, r, ns, d, lp, G_t = step_data
+                # [关键] 存入 group_adv 到 Buffer 的第三个位置 (原 reward 位)
+                shared_memory.remember((s, a, group_adv, ns, d, lp))
+
+        # 5. 公平计数 & 日志
+        with episode_lock:
+            if global_episode.value < total_episodes:
+                # [关键修正] 计数器 += GROUP_SIZE，确保与 PPO 在数据量上公平对比
+                global_episode.value += GROUP_SIZE
+                ep = global_episode.value
+
+        with save_lock:
+            avg_group_reward = np.mean(group_returns)
+            rewards_log.append(avg_group_reward)
+            speed_log.append(ep_speed / max(1, steps))
+            collision_log.append(is_crashed)
+
+        if pid == 0: print(f'\rEp {ep} GroupRew {avg_group_reward:.1f}', end='')
+
+        if not param_queue.empty():
+            try:
+                local_agent.load_state_dict(param_queue.get_nowait())
+            except:
+                pass
+
+    env.close()
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    args = parse_args()
+    set_seed(args.seed)
+    save_dir = f'results/grpo_main/seed_{args.seed}'
+
+    with mp.Manager() as manager:
+        dummy = gym.make(RAM_ENV_NAME)
+        state_dim = int(np.prod(dummy.observation_space.shape))
+        act_dim = dummy.action_space.n
+        dummy.close()
+
+        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
+                           LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                           manager=manager, is_worker=False, use_dynamic_beta=True)
+
+        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+
+====================
+FILE: ./experiments/train_grpo_ablation.py
+====================
+import sys, os, argparse
+import time
+import random
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+from multiprocessing import Process, Manager, Value, Lock
+import gym, torch
+import torch.multiprocessing as mp
+from models.agent_grpo import Agent_GRPO
+from config import *
+import custom_env
+
+# 必须与主实验一致
+GROUP_SIZE = 4
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    return parser.parse_args()
+
+
+def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    weights_path = os.path.join(save_dir, 'weights.pth')
+    param_queue = manager.Queue(maxsize=num_processes)
+    stop_event = manager.Event()
+    global_episode = Value('i', 0)
+    global_step = Value('i', 0)
+    episode_lock = manager.Lock()
+    save_lock = manager.Lock()
+
+    rewards_log = manager.list()
+    speed_log = manager.list()
+    collision_log = manager.list()
+
+    processes = []
+    for pid in range(num_processes):
+        # [消融实验] 传入 False, 关闭动态 Beta
+        p = mp.Process(target=sample_worker, args=(
+            env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+            stop_event, max_t, save_lock, rewards_log, speed_log, collision_log, False))
+        p.start()
+        processes.append(p)
+
+    initial_state_dict = agent.get_state_dict()
+    for _ in range(num_processes): param_queue.put(initial_state_dict)
+
+    last_log_time, update_count = time.time(), 0
+    try:
+        while global_episode.value < total_episodes:
+            if len(agent.memory) >= BATCH_SIZE * 4:
+                with save_lock:
+                    agent.learn(global_step.value)
+                    update_count += 1
+                    if time.time() - last_log_time > 5:
+                        print(
+                            f"[Ablation-NoDynamic] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f} (Fixed)")
+                        last_log_time = time.time()
+                    if update_count % 5 == 0:
+                        torch.save(agent.actor.state_dict(), weights_path)
+                        np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+                        np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+                        np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+
+                new_state_dict = agent.get_state_dict()
+                while not param_queue.empty():
+                    try:
+                        param_queue.get_nowait()
+                    except:
+                        pass
+                for _ in range(num_processes): param_queue.put(new_state_dict)
+            time.sleep(0.1)
+    finally:
+        stop_event.set()
+        [p.join() for p in processes]
+
+    torch.save(agent.actor.state_dict(), weights_path)
+    np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
+    np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
+    np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+
+
+def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
+                  stop_event, max_t, save_lock, rewards_log, speed_log, collision_log, use_dynamic_beta):
+    env = gym.make(env_id)
+    state_dim = int(np.prod(env.observation_space.shape))
+
+    # [消融实验] 初始化 Agent 时关闭 Dynamic Beta
+    local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
+                             GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                             manager=None, is_worker=True, use_dynamic_beta=use_dynamic_beta)
+    try:
+        local_agent.load_state_dict(param_queue.get(timeout=5))
+    except:
+        pass
+
+    while not stop_event.is_set():
+        # 1. 组采样 (与主实验逻辑完全一致)
+        group_seed = random.randint(0, 1000000)
+        group_trajectories = []
+        group_returns = []
+
+        for _ in range(GROUP_SIZE):
+            state, _ = env.reset(seed=group_seed)
+            state = state.flatten()
+            ep_reward, ep_speed, steps = 0, 0, 0
+            done = False
+            is_crashed = 0
+
+            traj_buffer = []
+
+            while not done and steps < max_t:
+                state_tensor = torch.FloatTensor(state).to(local_agent.device)
+                action, log_prob = local_agent.act(state_tensor)
+
+                res = env.step(action)
+                if len(res) == 5:
+                    next_state, reward, term, trunc, info = res
+                else:
+                    next_state, reward, done, info = res
+                done = term or trunc if len(res) == 5 else done
+
+                if info.get('crashed', False): is_crashed = 1
+                if len(state) >= 3: ep_speed += state[2]
+
+                next_state = next_state.flatten()
+                traj_buffer.append((state, action, reward, next_state, done, log_prob))
+                state = next_state.copy()
+                ep_reward += reward
+                steps += 1
+
+            G = 0
+            traj_with_G = []
+            for t in reversed(range(len(traj_buffer))):
+                s, a, r, ns, d, lp = traj_buffer[t]
+                G = r + GAMMA * G
+                traj_with_G.insert(0, (s, a, r, ns, d, lp, G))
+
+            group_trajectories.append(traj_with_G)
+            group_returns.append(G)
+
+            with global_step.get_lock():
+                global_step.value += steps
+
+        # 2. 组内归一化 (GRPO 核心步骤)
+        group_returns_arr = np.array(group_returns)
+        group_mean = group_returns_arr.mean()
+        group_std = group_returns_arr.std() + 1e-8
+
+        normalized_advantages = (group_returns_arr - group_mean) / group_std
+
+        # 3. 存入 Buffer
+        for i, traj in enumerate(group_trajectories):
+            group_adv = normalized_advantages[i]
+            for step_data in traj:
+                s, a, r, ns, d, lp, G_t = step_data
+                shared_memory.remember((s, a, group_adv, ns, d, lp))
+
+        # 4. 公平计数 (+= GROUP_SIZE)
+        with episode_lock:
+            if global_episode.value < total_episodes:
+                global_episode.value += GROUP_SIZE
+                ep = global_episode.value
+
+        with save_lock:
+            avg_group_reward = np.mean(group_returns)
+            rewards_log.append(avg_group_reward)
+            speed_log.append(ep_speed / max(1, steps))
+            collision_log.append(is_crashed)
+
+        if pid == 0: print(f'\rEp {ep} GroupRew {avg_group_reward:.1f}', end='')
+
+        if not param_queue.empty():
+            try:
+                local_agent.load_state_dict(param_queue.get_nowait())
+            except:
+                pass
+
+    env.close()
+
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    args = parse_args()
+    set_seed(args.seed)
+    save_dir = f'results/grpo_no_dynamic/seed_{args.seed}'
+
+    with mp.Manager() as manager:
+        dummy = gym.make(RAM_ENV_NAME)
+        state_dim = int(np.prod(dummy.observation_space.shape))
+        act_dim = dummy.action_space.n
+        dummy.close()
+
+        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
+                           LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
+                           manager=manager, is_worker=False, use_dynamic_beta=False)
+
+        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+
+====================
+FILE: ./models/__init__.py
+====================
+
+
+====================
+FILE: ./models/agent_grpo.py
+====================
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
+from models.networks import Actor
+from models.replay_buffer import Replay_Buffer
+
+
+class Agent_GRPO:
+    """
+    GRPO Agent (修复版)
+    核心变动：
+    1. learn() 函数不再计算 Monte-Carlo Return，也不再进行全局归一化。
+       它假设 Buffer 中取出的 'rewards' 字段已经是 Worker 计算好的 'Group Relative Advantage'。
+    2. calculate_risk() 修复了索引逻辑，配合 Observation Fixed 模式使用。
+    """
+
+    def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
+                 critic_loss_coef, entropy_coef, device, shared=False, manager=None, is_worker=False,
+                 use_dynamic_beta=True):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.bs = bs
+        self.lr = lr
+        self.dr = dr
+        self.decay_step_size = decay_step_size
+        self.gamma = gamma
+        self.lam = lam
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.entropy_coef = entropy_coef
+        self.device = device
+
+        # 是否使用动态 Beta (主实验 True, 消融实验 False)
+        self.use_dynamic_beta = use_dynamic_beta
+
+        self.beta_init = 0.01
+        self.beta_max = 0.2
+        self.beta = self.beta_init
+
+        # Buffer 大小需能容纳多进程并行产生的数据
+        self.memory = Replay_Buffer(int(50000), bs, manager)
+
+        if shared:
+            self.actor = Actor(state_size, action_size).share_memory().to(device)
+        else:
+            self.actor = Actor(state_size, action_size).to(device)
+
+        if not is_worker:
+            self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
+
+        self.entropy = 0
+
+    def act(self, state, deterministic=False):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            action_probs = self.actor(state)
+
+        if deterministic:
+            action_tensor = torch.argmax(action_probs, dim=1)
+            log_prob = 0.0
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        action_val = action_tensor.cpu().numpy().flatten()
+        return int(action_val[0]), log_prob
+
+    def calculate_risk(self, state):
+        """
+        计算风险值 (Risk)
+        依赖: custom_env.py 配置中 observation order="fixed"
+        """
+        if state.shape[1] < 10: return 0.0
+
+        batch_size = state.shape[0]
+        num_feats = 5  # x, y, vx, vy, heading
+
+        # Reshape: [Batch, Vehicles, Feats]
+        reshaped = state.view(batch_size, -1, num_feats)
+
+        # Ego is at Index 0 (Fixed order)
+        ego_x = reshaped[:, 0, 0]
+        ego_y = reshaped[:, 0, 1]
+
+        # Others start from Index 1
+        others_x = reshaped[:, 1:, 0]
+        others_y = reshaped[:, 1:, 1]
+
+        # 计算归一化距离
+        dists_norm = torch.sqrt((others_x - ego_x.unsqueeze(1)) ** 2 + (others_y - ego_y.unsqueeze(1)) ** 2)
+
+        # 还原真实距离 (highway-env 坐标范围 approx 100)
+        dists_real = dists_norm * 100.0
+
+        # 过滤 Ghost Vehicles (距离极近的通常是 padding)
+        valid_mask = dists_norm > 0.001
+        dists_real_masked = dists_real.clone()
+        dists_real_masked[~valid_mask] = float('inf')
+
+        # 限制最小距离
+        min_dist, _ = torch.min(torch.clamp(dists_real_masked, min=5.0), dim=1)
+
+        # Risk 模型: 距离越近 Risk 越大
+        risk = 20.0 / min_dist
+        risk = torch.nan_to_num(risk, nan=0.0, posinf=0.0)
+
+        return risk.mean().item()
+
+    def learn(self, current_total_timesteps):
+        # [核心修正]
+        # get_all_and_clear 返回的第三个参数原本是 rewards，现在存储的是 advantages
+        states, actions, advantages, next_states, dones, logprobs = self.memory.get_all_and_clear()
+
+        if states is None or len(states) < self.bs: return
+
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        advantages = advantages.to(self.device)  # 这是 Worker 算好的相对优势
+        logprobs = logprobs.to(self.device)
+
+        # Clip Advantage 保证数值稳定
+        advantages = torch.clamp(advantages, -4.0, 4.0)
+
+        # 动态 Beta 更新逻辑
+        if self.use_dynamic_beta:
+            current_risk = self.calculate_risk(states)
+            target_beta = self.beta_init * (1 + current_risk)
+            self.beta = min(target_beta, self.beta_max)
+        else:
+            self.beta = self.beta_init  # 消融实验会一直跑这里
+
+        # 学习率衰减
+        decay = self.dr ** (current_total_timesteps // self.decay_step_size)
+        for pg in self.optimizer.param_groups: pg['lr'] = self.lr * decay
+
+        # PPO Update Loop
+        dataset_size = states.size(0)
+        indices = np.arange(dataset_size)
+
+        for _ in range(self.K_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, dataset_size, self.bs):
+                end = start + self.bs
+                idx = indices[start:end]
+
+                mb_states = states[idx]
+                mb_actions = actions[idx]
+                mb_old_log = logprobs[idx]
+                mb_adv = advantages[idx]  # 直接使用
+
+                action_probs = self.actor(mb_states)
+                dist = torch.distributions.Categorical(action_probs)
+                mb_new_log = dist.log_prob(mb_actions)
+                dist_entropy = dist.entropy().mean()
+
+                ratio = torch.exp(mb_new_log - mb_old_log)
+
+                with torch.no_grad():
+                    approx_kl = 0.5 * ((mb_new_log - mb_old_log) ** 2).mean()
+
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
+
+                loss = -torch.min(surr1, surr2).mean() + \
+                       self.beta * approx_kl - \
+                       self.entropy_coef * decay * dist_entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                self.optimizer.step()
+
+        self.entropy = dist_entropy.item()
+
+    def get_state_dict(self):
+        return {'actor': self.actor.state_dict()}
+
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd['actor'])
+
+====================
+FILE: ./models/networks.py
+====================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Actor (PPO & GRPO) ---
+class Actor(nn.Module):
+    def __init__(self, state_size, action_size, hidden=[512, 512]):
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], action_size)
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return F.softmax(self.fc3(x), dim=1)
+
+# --- Critic (PPO Only) ---
+class Critic(nn.Module):
+    def __init__(self, state_size, hidden=[512, 512]):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], 1)
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# --- Q-Network (DQN Only) ---
+class QNetwork(nn.Module):
+    def __init__(self, state_size, action_size, hidden=[512, 512]):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], action_size)
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+def weights_init_(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1)
+        torch.nn.init.constant_(m.bias, 0)
+
+====================
+FILE: ./models/replay_buffer.py
+====================
+import numpy as np
+import random
+import torch
+from multiprocessing import Lock
+
+class Replay_Buffer:
+    def __init__(self, capacity=int(1e6), batch_size=64, manager=None):
+        self.capacity = capacity
+        self.batch_size = batch_size
+        self.lock = manager.Lock() if manager else Lock()
+        self.memory = manager.list() if manager else []
+
+    def remember(self, transition):
+        with self.lock:
+            if len(self.memory) < self.capacity:
+                self.memory.append(transition)
+            else:
+                if not isinstance(self.memory, list): self.memory.pop(0)
+                self.memory.append(transition)
+
+    def sample(self, k=None):
+        if k is None: k = self.batch_size
+        with self.lock:
+            if len(self.memory) < k: return None, None, None, None, None, None
+            indices = random.sample(range(len(self.memory)), k)
+            batch = [self.memory[i] for i in indices]
+        return self._process_batch(batch)
+
+    def get_all_and_clear(self):
+        with self.lock:
+            batch = list(self.memory)
+            del self.memory[:]
+        return self._process_batch(batch)
+
+    def _process_batch(self, batch):
+        if not batch: return None, None, None, None, None, None
+        states, actions, rewards, next_states, dones, log_probs = zip(*batch)
+        states = torch.tensor(np.array(states), dtype=torch.float32)
+        actions = torch.tensor(np.array(actions), dtype=torch.long)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32)
+        dones = torch.tensor(np.array(dones), dtype=torch.float32)
+        if log_probs[0] is not None:
+            log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32)
+        else: log_probs = None
+        return states, actions, rewards, next_states, dones, log_probs
+
+    def clear(self):
+        with self.lock: del self.memory[:]
+    def __len__(self): return len(self.memory)
+
+====================
+FILE: ./models/agent_ppo.py
+====================
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
+from models.networks import Actor, Critic
+from models.replay_buffer import Replay_Buffer
+
+
+class Agent_PPO:
+    def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
+                 critic_loss_coef, entropy_coef, device, shared=False, manager=None, is_worker=False):
+        self.state_size, self.action_size = state_size, action_size
+        self.bs, self.lr, self.dr, self.decay_step_size = bs, lr, dr, decay_step_size
+        self.gamma, self.lam, self.eps_clip, self.K_epochs = gamma, lam, eps_clip, K_epochs
+        self.critic_loss_coef, self.entropy_coef, self.device = critic_loss_coef, entropy_coef, device
+
+        self.memory = Replay_Buffer(int(20000), bs, manager)
+        if shared:
+            self.actor = Actor(state_size, action_size).share_memory().to(device)
+            self.critic = Critic(state_size).share_memory().to(device)
+        else:
+            self.actor = Actor(state_size, action_size).to(device)
+            self.critic = Critic(state_size).to(device)
+
+        if not is_worker:
+            self.optimizer = optim.Adam([
+                {'params': self.actor.parameters()}, {'params': self.critic.parameters()}
+            ], lr=lr)
+        self.mse_loss = nn.MSELoss()
+        self.entropy = 0
+
+    def act(self, state, deterministic=False):
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            action_probs = self.actor(state)
+
+        if deterministic:
+            action_tensor = torch.argmax(action_probs, dim=1)
+            log_prob = 0.0
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        # --- [终极修复] 强制转为 Python int ---
+        action_val = action_tensor.cpu().numpy()
+        action_val = action_val.flatten()
+        return int(action_val[0]), log_prob
+
+    def learn(self, current_total_timesteps):
+        states, actions, rewards, next_states, dones, logprobs = self.memory.get_all_and_clear()
+        if states is None or len(states) < self.bs: return
+
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+        logprobs = logprobs.to(self.device)
+
+        with torch.no_grad():
+            values = self.critic(states).squeeze(-1)
+            next_values = self.critic(next_states).squeeze(-1)
+            advantages = torch.zeros_like(rewards).to(self.device)
+            delta = rewards + self.gamma * next_values * (1 - dones) - values
+            advantage = 0
+            for t in reversed(range(len(rewards))):
+                if dones[t]: advantage = 0
+                advantage = delta[t] + self.gamma * self.lam * advantage
+                advantages[t] = advantage
+            returns = advantages + values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        decay = self.dr ** (current_total_timesteps // self.decay_step_size)
+        for pg in self.optimizer.param_groups: pg['lr'] = self.lr * decay
+
+        dataset_size = states.size(0)
+        indices = np.arange(dataset_size)
+        for _ in range(self.K_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, dataset_size, self.bs):
+                end = start + self.bs
+                idx = indices[start:end]
+                mb_states, mb_actions = states[idx], actions[idx]
+                mb_old_log, mb_adv, mb_ret = logprobs[idx], advantages[idx], returns[idx]
+
+                action_probs = self.actor(mb_states)
+                dist = torch.distributions.Categorical(action_probs)
+                mb_new_log = dist.log_prob(mb_actions)
+                dist_entropy = dist.entropy().mean()
+                mb_val = self.critic(mb_states).squeeze(-1)
+
+                ratio = torch.exp(mb_new_log - mb_old_log)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
+                loss = -torch.min(surr1, surr2).mean() + \
+                       self.critic_loss_coef * self.mse_loss(mb_val, mb_ret) - \
+                       self.entropy_coef * decay * dist_entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                self.optimizer.step()
+        self.entropy = dist_entropy.item()
+
+    def get_state_dict(self):
+        return {'actor': self.actor.state_dict(), 'critic': self.critic.state_dict()}
+
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd['actor'])
+        self.critic.load_state_dict(sd['critic'])
+
+====================
+FILE: ./models/agent_dqn.py
+====================
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import random
+from models.networks import QNetwork
+from models.replay_buffer import Replay_Buffer
+
+
+# --- 注意：这里千万不要有 "from models.agent_dqn import Agent_DQN" ---
+
+class Agent_DQN:
+    def __init__(self, state_size, action_size, bs, lr, gamma, epsilon_start, epsilon_end, epsilon_decay, device,
+                 manager=None):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.bs = bs
+        self.gamma = gamma
+        self.device = device
+
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+
+        self.q_net = QNetwork(state_size, action_size).to(device)
+        self.target_net = QNetwork(state_size, action_size).to(device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        # DQN 这里的 replay buffer 大小设为 50000
+        self.memory = Replay_Buffer(int(50000), bs, manager)
+        self.update_counter = 0
+
+    # --- act 函数 (兼容 deterministic 参数) ---
+    def act(self, state, deterministic=False):
+        """
+        deterministic=True: 测试模式，完全贪婪 (epsilon=0)
+        deterministic=False: 训练模式，使用 epsilon-greedy
+        """
+        eps = 0.0 if deterministic else self.epsilon
+
+        if random.random() > eps:
+            state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                q_values = self.q_net(state)
+            action = torch.argmax(q_values).item()
+        else:
+            action = random.randrange(self.action_size)
+
+        # 返回 (action, log_prob=0) 以兼容接口
+        return action, 0.0
+
+    def learn(self, current_step=None):
+        states, actions, rewards, next_states, dones, _ = self.memory.sample(self.bs)
+        if states is None: return
+
+        states = states.to(self.device)
+        actions = actions.to(self.device)
+        rewards = rewards.to(self.device)
+        next_states = next_states.to(self.device)
+        dones = dones.to(self.device)
+
+        with torch.no_grad():
+            q_next = self.target_net(next_states).max(1)[0].unsqueeze(1)
+            q_target = rewards.unsqueeze(1) + (self.gamma * q_next * (1 - dones.unsqueeze(1)))
+
+        q_expected = self.q_net(states).gather(1, actions.unsqueeze(1))
+        loss = F.mse_loss(q_expected, q_target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_counter += 1
+        if self.update_counter % 100 == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
+
+        if self.epsilon > self.epsilon_end:
+            self.epsilon *= self.epsilon_decay
+
+    def get_state_dict(self):
+        return self.q_net.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.q_net.load_state_dict(state_dict)
+
+====================
+FILE: ./evaluation/test_model.py
+====================
+import sys
+import os
+
+# --- 1. 路径修正：确保能导入根目录的模块 ---
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+# ----------------------------------------
+
+import numpy as np
+import gym
+import torch
+import time
+import argparse
+from config import *
+import custom_env
+
+# 动态导入所有 Agent
+from models.agent_ppo import Agent_PPO
+from models.agent_grpo import Agent_GRPO
+from models.agent_dqn import Agent_DQN
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="模型测试脚本")
+    parser.add_argument('--algo', type=str, default='grpo', choices=['ppo', 'grpo', 'dqn'],
+                        help='选择算法: ppo, grpo, dqn')
+    parser.add_argument('--seed', type=int, default=0, help='加载哪个种子的权重')
+    parser.add_argument('--episodes', type=int, default=5, help='测试几轮')
+    parser.add_argument('--render', action='store_true', default=True, help='是否渲染画面 (默认开启)')
+    parser.add_argument('--no-render', action='store_false', dest='render', help='关闭画面渲染')
+    return parser.parse_args()
+
+
+def get_model_path(algo, seed):
+    folder_map = {
+        'ppo': 'ppo',
+        'grpo': 'grpo_main',
+        'dqn': 'dqn'
+    }
+    folder = folder_map.get(algo, algo)
+    return os.path.join('results', folder, f'seed_{seed}', 'weights.pth')
+
+
+def test(env, agent, episodes, max_t, render):
+    print(f"\n🚗 开始测试: {episodes} 轮 | 渲染: {render}")
+
+    for i in range(episodes):
+        state = env.reset()
+        if isinstance(state, tuple): state = state[0]
+        state = state.flatten()
+
+        ep_reward = 0
+        ep_speed = []
+        done = False
+        t = 0
+
+        print(f"\n--- Episode {i + 1} Start ---")
+
+        while not done and t < max_t:
+            t += 1
+
+            state_tensor = torch.FloatTensor(state).to(agent.device).unsqueeze(0)
+
+            # 开启确定性模式
+            action, _ = agent.act(state_tensor, deterministic=True)
+
+            step_result = env.step(action)
+            if len(step_result) == 5:
+                next_state, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
+            else:
+                next_state, reward, done, info = step_result
+
+            if hasattr(env.unwrapped, 'vehicle'):
+                ep_speed.append(env.unwrapped.vehicle.speed)
+
+            if done:
+                is_crashed = info.get('crashed', False) or getattr(env.unwrapped.vehicle, 'crashed', False)
+                end_reason = "💥 CRASHED" if is_crashed else "⏱️ TIME LIMIT"
+                print(f"   -> Terminated at Step {t} | Reason: {end_reason}")
+
+            next_state = next_state.flatten()
+            state = next_state.copy()
+
+            # --- [关键修复] 渲染逻辑增强 ---
+            if render:
+                try:
+                    env.render()  # 新版尝试
+                except:
+                    try:
+                        env.render(mode='human')  # 旧版尝试
+                    except Exception as e:
+                        pass  # 忽略渲染错误，保证程序不崩
+                time.sleep(0.03)
+
+            ep_reward += reward
+
+        avg_speed = np.mean(ep_speed) if ep_speed else 0
+        print(f"   Episode {i + 1} Reward: {ep_reward:.2f} | Avg Speed: {avg_speed:.2f} m/s")
+
+
+def main():
+    args = parse_args()
+
+    # --- [关键修复] 强制设置渲染模式 ---
+    # 我们尝试多种方式来“激活” highway-env 的渲染窗口
+    env = None
+    try:
+        if args.render:
+            # 方式 1: 标准新版 Gym
+            env = gym.make(RAM_ENV_NAME, render_mode='human')
+        else:
+            env = gym.make(RAM_ENV_NAME)
+    except Exception as e:
+        print(f"⚠️ Standard make failed ({e}), trying fallback...")
+        # 方式 2: 旧版兼容
+        env = gym.make(RAM_ENV_NAME)
+
+    # 方式 3: 暴力补丁 (针对某些 highway-env 版本)
+    if args.render:
+        try:
+            env.unwrapped.render_mode = 'human'
+            # 有些版本需要设置 config 里的 mode
+            if hasattr(env.unwrapped, 'config'):
+                env.unwrapped.config['render_mode'] = 'human'
+        except:
+            pass
+
+    # 自动获取维度
+    state_dim = int(np.prod(env.observation_space.shape))
+    act_dim = env.action_space.n
+
+    print(f"🔍 Environment: {RAM_ENV_NAME}")
+    print(f"🔍 State Dim: {state_dim}, Action Dim: {act_dim}")
+    print(f"🔍 Algorithm: {args.algo.upper()}")
+
+    if args.algo == 'ppo':
+        agent = Agent_PPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA, LAMDA,
+                          EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE)
+    elif args.algo == 'grpo':
+        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
+                           LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE)
+    elif args.algo == 'dqn':
+        agent = Agent_DQN(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, GAMMA, 0.0, 0.0, 0.0, DEVICE)
+    else:
+        raise ValueError(f"Unknown algorithm: {args.algo}")
+
+    # 加载权重
+    model_path = get_model_path(args.algo, args.seed)
+    print(f"📂 Loading weights from: {model_path}")
+
+    if os.path.exists(model_path):
+        try:
+            checkpoint = torch.load(model_path, map_location=DEVICE)
+            if args.algo == 'dqn':
+                agent.q_net.load_state_dict(checkpoint)
+            else:
+                if isinstance(checkpoint, dict) and 'actor' in checkpoint:
+                    agent.actor.load_state_dict(checkpoint['actor'])
+                else:
+                    agent.actor.load_state_dict(checkpoint)
+            print("✅ Weights loaded successfully!")
+        except Exception as e:
+            print(f"❌ Error loading weights: {e}")
+            print("⚠️ Running with RANDOM weights (Expect bad performance)")
+    else:
+        print(f"❌ File not found: {model_path}")
+        print("⚠️ Running with RANDOM weights")
+
+    try:
+        test(env, agent, args.episodes, MAX_T, args.render)
+    except KeyboardInterrupt:
+        print("\n🛑 Test interrupted by user.")
+    finally:
+        env.close()
+        print("Done.")
+
+
+if __name__ == '__main__':
+    main()

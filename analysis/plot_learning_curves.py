@@ -54,8 +54,8 @@ def plot_all():
     exps = {
         'GRPO (Ours)': 'grpo_main',  # 红色 (默认第一色)
         'PPO (Baseline)': 'ppo',  # 蓝色
-        'GRPO (No Dynamic Beta)': 'grpo_no_dynamic',  # 绿色/橙色 (消融)
-        'DQN (Baseline)': 'dqn'  # 紫色/其他
+        #'GRPO (No Dynamic Beta)': 'grpo_no_dynamic',  # 绿色/橙色 (消融)
+        #'DQN (Baseline)': 'dqn'  # 紫色/其他
     }
 
     # 自动分配颜色，或者你可以手动指定 palette

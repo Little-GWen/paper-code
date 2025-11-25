@@ -15,7 +15,7 @@ ALGORITHMS = [
     ("experiments/train_ppo.py", "PPO (Baseline)"),
 
     # 3. DQN 基线 (Baseline) - [已开启]
-    ("experiments/train_dqn.py", "DQN (Baseline)"),
+    #("experiments/train_dqn.py", "DQN (Baseline)"),
 
     # 4. GRPO 消融实验 (Ablation) - [已开启]
     ("experiments/train_grpo_ablation.py", "GRPO (Ablation)")
