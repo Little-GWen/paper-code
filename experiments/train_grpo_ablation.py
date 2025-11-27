@@ -12,7 +12,7 @@ from config import *
 import custom_env
 
 # 必须与主实验一致
-GROUP_SIZE = 4
+GROUP_SIZE = 8
 
 
 def parse_args():

@@ -12,16 +12,16 @@ RAM_ENV_NAME = 'highway-v0'
 
 # 训练参数
 # [优化] 增大 Batch Size 以稳定梯度估计
-NUM_PROCESSES = 30
+NUM_PROCESSES = 10
 BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
 LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
 
 # 衰减参数
 DECAY_RATE = 0.999
-DECAY_STEP_SIZE = 50000
+DECAY_STEP_SIZE = 10000
 
 # 算法通用参数
-GAMMA = 0.99
+GAMMA = 0.985
 TAU = 0.001
 
 # PPO/GRPO 特有参数
@@ -32,7 +32,7 @@ CRITIC_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
 
 # 训练时长
-RAM_NUM_EPISODE = 50000  # 稍微增加总轮次
+RAM_NUM_EPISODE = 10000  # 稍微增加总轮次
 MAX_T = 1000
 
 # 可视化参数

@@ -16,7 +16,7 @@ RAM_ENV_NAME = 'highway-v0'
 
 # 训练参数
 # [优化] 增大 Batch Size 以稳定梯度估计
-NUM_PROCESSES = 30
+NUM_PROCESSES = 10
 BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
 LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
 
@@ -36,7 +36,7 @@ CRITIC_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
 
 # 训练时长
-RAM_NUM_EPISODE = 50000  # 稍微增加总轮次
+RAM_NUM_EPISODE = 10000  # 稍微增加总轮次
 MAX_T = 1000
 
 # 可视化参数
@@ -108,7 +108,7 @@ ALGORITHMS = [
     ("experiments/train_ppo.py", "PPO (Baseline)"),
 
     # 3. DQN 基线 (Baseline) - [已开启]
-    ("experiments/train_dqn.py", "DQN (Baseline)"),
+    #("experiments/train_dqn.py", "DQN (Baseline)"),
 
     # 4. GRPO 消融实验 (Ablation) - [已开启]
     ("experiments/train_grpo_ablation.py", "GRPO (Ablation)")
@@ -195,13 +195,13 @@ class HighwayEnv(AbstractEnv):
             },
             "action": {"type": "DiscreteMetaAction"},
             "lanes_count": 4,
-            "vehicles_count": 25,
+            "vehicles_count": 15,
             "traffic_spawn_length": 600,
             "initial_ego_speed": 25,
             "initial_traffic_speed": 20,
-            "duration": 1000,
+            "duration": 600,
             # [关键修正] 奖励调整
-            "collision_reward": -15.0,  # 原 -50，太重了会导致模型不敢动
+            "collision_reward": -50.0,  # 原 -50，太重了会导致模型不敢动
             "reward_speed_range": [20, 35],
             "offroad_terminal": False
         })
@@ -315,87 +315,142 @@ import seaborn as sns
 
 RESULTS_DIR = '../results'
 
+# 定义实验配置，包含 step_scale (X轴缩放倍率)
+experiments_config = {
+    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 4},  # 关键：GRPO 1步顶4步
+    'PPO (Baseline)': {'folder': 'ppo', 'step_scale': 1},  # PPO 1步就是1步
+    'GRPO (Ablation)': {'folder': 'grpo_no_dynamic', 'step_scale': 4},
+    'DQN (Baseline)': {'folder': 'dqn', 'step_scale': 1}
+}
 
-def get_data(algo_folder):
-    path = os.path.join(RESULTS_DIR, algo_folder)
+
+def get_data(label, config, filename='rewards.npy', transform=None):
+    """
+    通用数据读取函数
+    filename: 'rewards.npy' 或 'collision.npy' 或 'speed.npy'
+    transform: 一个函数，用于对原始数据进行变换 (例如 lambda x: 1 - x)
+    """
+    folder = config['folder']
+    step_scale = config['step_scale']
+
+    path = os.path.join(RESULTS_DIR, folder)
     if not os.path.exists(path):
-        print(f"⚠️  文件夹未找到 (跳过): {path}")
+        # print(f"⚠️  文件夹未找到 (跳过): {path}")
         return None
 
-    all_data = []
-    min_len = float('inf')
+    all_dfs = []
 
-    # 遍历所有种子文件夹 seed_0, seed_1 ...
+    # 遍历所有种子
     seed_folders = [d for d in os.listdir(path) if d.startswith('seed_')]
-
-    if not seed_folders:
-        print(f"⚠️  {algo_folder} 下没有找到 seed_X 文件夹")
-        return None
+    if not seed_folders: return None
 
     for seed_folder in seed_folders:
-        file_path = os.path.join(path, seed_folder, 'rewards.npy')
+        file_path = os.path.join(path, seed_folder, filename)
         if os.path.exists(file_path):
             try:
-                rewards = np.load(file_path)
-                # 数据平滑 (Smoothing)
-                rewards = pd.Series(rewards).rolling(window=50, min_periods=1).mean().values
-                all_data.append(rewards)
-                if len(rewards) < min_len: min_len = len(rewards)
+                data = np.load(file_path)
+
+                # [新增] 数据转换逻辑 (例如计算非碰撞率)
+                if transform is not None:
+                    data = transform(data)
+
+                # 数据平滑 (Window Size 可调)
+                # 对于 Safety Rate，稍微平滑一点好看
+                window_size = 100 if 'collision' in filename else 50
+                data_smooth = pd.Series(data).rolling(window=window_size, min_periods=1).mean().values
+
+                # 构建 DataFrame
+                # [关键逻辑] X轴 = 索引 * 缩放倍率
+                steps = np.arange(len(data_smooth)) * step_scale
+
+                df_seed = pd.DataFrame({
+                    'Episode': steps,
+                    'Value': data_smooth,
+                    'Algorithm': label
+                })
+                all_dfs.append(df_seed)
             except:
                 print(f"❌ 读取错误: {file_path}")
 
-    if not all_data: return None
-
-    # 截断到最小长度，保证矩阵整齐
-    data_matrix = np.array([d[:min_len] for d in all_data])
-
-    # 转换为 DataFrame
-    df = pd.DataFrame(data_matrix).melt()
-    df.columns = ['Episode', 'Reward']
-    return df
+    if not all_dfs: return None
+    return pd.concat(all_dfs, ignore_index=True)
 
 
-def plot_all():
+def plot_metric(metric_name, filename, ylabel, title, save_name, transform=None, y_limit=None):
+    """
+    通用画图函数
+    """
     plt.figure(figsize=(10, 6))
     sns.set_theme(style="whitegrid")
 
-    # 定义要画的算法 (Label名称 : 文件夹名称)
-    exps = {
-        'GRPO (Ours)': 'grpo_main',  # 红色 (默认第一色)
-        'PPO (Baseline)': 'ppo',  # 蓝色
-        'GRPO (No Dynamic Beta)': 'grpo_no_dynamic',  # 绿色/橙色 (消融)
-        #'DQN (Baseline)': 'dqn'  # 紫色/其他
-    }
-
-    # 自动分配颜色，或者你可以手动指定 palette
-    # palette = {'GRPO (Ours)': 'red', ...}
-
-    plotted_count = 0
-    for label, folder in exps.items():
-        df = get_data(folder)
+    all_data = []
+    for label, config in experiments_config.items():
+        df = get_data(label, config, filename, transform)
         if df is not None:
-            sns.lineplot(data=df, x='Episode', y='Reward', label=label, linewidth=2.5)
-            plotted_count += 1
+            all_data.append(df)
 
-    if plotted_count == 0:
-        print("❌ 没有找到任何数据，请先运行 run_experiments.py")
+    if not all_data:
+        print(f"❌ 没有找到 {metric_name} 数据")
         return
 
-    plt.title("Training Performance Comparison (4-Lane High Density)", fontsize=15, fontweight='bold')
-    plt.xlabel("Training Episodes", fontsize=12)
-    plt.ylabel("Average Reward", fontsize=12)
-    plt.legend(fontsize=11, loc='lower right')
+    # 合并所有数据画图
+    final_df = pd.concat(all_data, ignore_index=True)
+
+    # 绘制带置信区间的曲线
+    sns.lineplot(data=final_df, x='Episode', y='Value', hue='Algorithm', linewidth=2.0)
+
+    plt.title(title, fontsize=15, fontweight='bold')
+    plt.xlabel("Training Episodes (Equivalent)", fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+
+    if y_limit:
+        plt.ylim(y_limit)
+
+    plt.legend(fontsize=11, loc='best')
     plt.tight_layout()
 
-    save_path = "learning_curve_full.png"
+    # 保存图片
+    save_path = os.path.join('analysis', save_name)
+    if not os.path.exists('analysis'): os.makedirs('analysis')
     plt.savefig(save_path, dpi=300)
-    print(f"\n✅ 图表已保存至 analysis/{save_path}")
-    print("打开它看看你的论文核心结果吧！")
-    plt.show()
+    print(f"\n✅ {metric_name} 图表已保存至 {save_path}")
 
 
 if __name__ == "__main__":
-    plot_all()
+    print("📊 正在绘制训练曲线...")
+
+    # 1. 绘制 Reward 曲线
+    plot_metric(
+        metric_name="Reward",
+        filename="rewards.npy",
+        ylabel="Average Reward",
+        title="Training Performance (Reward)",
+        save_name="learning_curve_reward.png"
+    )
+
+    # 2. 绘制 非碰撞率 (Safety Rate) [核心修改]
+    # 使用 lambda x: 1 - x 将 碰撞(1) 转换为 安全(0)，反之亦然
+    # 注意：原始数据中 1=Crashed, 0=Safe。所以 1-x 后，1=Safe, 0=Crashed。
+    plot_metric(
+        metric_name="Safety Rate",
+        filename="collision.npy",
+        ylabel="Safety Rate (Higher is Better)",
+        title="Safety Performance (No-Collision Rate)",
+        save_name="learning_curve_safety_rate.png",
+        transform=lambda x: 1.0 - x,  # <--- 这里的魔法
+        y_limit=(0.0, 1.05)  # 固定 Y 轴范围
+    )
+
+    # 3. 绘制 Speed 曲线
+    plot_metric(
+        metric_name="Average Speed",
+        filename="speed.npy",
+        ylabel="Avg Speed (m/s)",
+        title="Driving Efficiency (Speed)",
+        save_name="learning_curve_speed.png"
+    )
+
+    print("\n🎉 所有图表绘制完成！请查看 analysis/ 文件夹。")
 
 ====================
 FILE: ./analysis/analyze_convergence.py

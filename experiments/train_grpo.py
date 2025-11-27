@@ -12,7 +12,7 @@ from config import *
 import custom_env
 
 # 组大小 (Sample G trajectories for same state)
-GROUP_SIZE = 4
+GROUP_SIZE = 8
 
 
 def parse_args():

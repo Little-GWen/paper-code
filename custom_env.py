@@ -37,13 +37,13 @@ class HighwayEnv(AbstractEnv):
             },
             "action": {"type": "DiscreteMetaAction"},
             "lanes_count": 4,
-            "vehicles_count": 25,
+            "vehicles_count": 12,
             "traffic_spawn_length": 600,
             "initial_ego_speed": 25,
             "initial_traffic_speed": 20,
-            "duration": 1000,
+            "duration": 600,
             # [关键修正] 奖励调整
-            "collision_reward": -15.0,  # 原 -50，太重了会导致模型不敢动
+            "collision_reward": -100.0,  # 原 -50，太重了会导致模型不敢动
             "reward_speed_range": [20, 35],
             "offroad_terminal": False
         })
@@ -106,7 +106,7 @@ class HighwayEnv(AbstractEnv):
         r_speed = np.clip(scaled_speed, 0, 1) * 2.0  # 满速得 2 分
 
         # 3. 存活奖励 (放大权重)
-        r_survival = 1.0  # 只要活着就一直加分
+        r_survival = 1  # 只要活着就一直加分
 
         # 4. 变道惩罚
         r_lane_change = 0
