@@ -9,10 +9,11 @@ from models.replay_buffer import Replay_Buffer
 
 class Agent_GRPO:
     """
-    GRPO Agent (优化版 - Risk Aware v2)
-    核心修复：
-    1. calculate_risk: 归一化到 [0, 1]，防止数值爆炸。
-    2. Dynamic Beta: 逻辑反转 -> 危险时放松约束 (Beta变小)，允许大幅修正动作。
+    GRPO Agent (修复版)
+    核心变动：
+    1. learn() 函数不再计算 Monte-Carlo Return，也不再进行全局归一化。
+       它假设 Buffer 中取出的 'rewards' 字段已经是 Worker 计算好的 'Group Relative Advantage'。
+    2. calculate_risk() 修复了索引逻辑，配合 Observation Fixed 模式使用。
     """
 
     def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
@@ -34,9 +35,8 @@ class Agent_GRPO:
         # 是否使用动态 Beta
         self.use_dynamic_beta = use_dynamic_beta
 
-        # Beta 参数设置
-        self.beta_init = 0.01  # 初始 KL 惩罚系数
-        self.beta_min = 0.001  # 最小 Beta (危险时保留微弱约束)
+        self.beta_init = 0.01
+        self.beta_min = 0.0001
         self.beta = self.beta_init
 
         # Buffer 大小需能容纳多进程并行产生的数据
@@ -70,87 +70,167 @@ class Agent_GRPO:
 
     def calculate_risk(self, state):
         """
-        计算风险值 (Risk) - 线性映射版
-        输出: [0.0, 1.0]
-        Logic:
-            Distance > 30m -> Risk = 0.0 (Safe)
-            Distance < 5m  -> Risk = 1.0 (Danger)
+        计算风险值 (Risk)
+        引入相对速度 (Time-to-Collision)
         """
-        if state.shape[1] < 10: return 0.0
+        # 设定 TTC 阈值
+        ttc_threshold = 5.0
 
+        # --- 维度重塑 ---
+        # state 输入形状: (Batch_Size, 75) -> 扁平的向量
+        # 我们需要把 state 重塑成: (Batch_Size, 15, 5) -> (Batch, 车辆数, 特征数)，方便后续使用 [:, 0, 0] 这种索引
         batch_size = state.shape[0]
-        num_feats = 5  # x, y, vx, vy, heading
+        num_features = 5  # x, y, vx, vy, heading
+        num_vehicles = state.shape[1] // num_features  # 车辆数 (75 / 5 = 15)
+        reshaped_state = state.view(batch_size, num_vehicles, num_features)  # 不改变原数据
 
-        # Reshape: [Batch, Vehicles, Feats]
-        # 假设 obs 是 fixed order, index 0 是 ego
-        reshaped = state.view(batch_size, -1, num_feats)
+        # 获取与周围车辆相对位置与相对速度（接近速度）
+        # 注意：需要反归一化（根据 custom_env 中的环境配置）
+        delta_x = reshaped_state[:, 1:, 0] * 100.0
+        delta_y = reshaped_state[:, 1:, 1] * 100.0
+        rel_vx = reshaped_state[:, 1:, 2] * 20.0
+        rel_vy = reshaped_state[:, 1:, 3] * 20.0
 
-        ego_x = reshaped[:, 0, 0]
-        ego_y = reshaped[:, 0, 1]
+        # 计算欧式距离，限制撞车时最小值为 1e-6
+        dists = torch.sqrt(delta_x ** 2 + delta_y ** 2) + 1e-6
 
-        others_x = reshaped[:, 1:, 0]
-        others_y = reshaped[:, 1:, 1]
+        # 计算接近速度 - -- 使用向量点积投影: (pos · vel)
+        # 结果 > 0: 正在远离 (位置向量和速度向量方向一致)
+        # 结果 < 0: 正在靠近 (位置向量和速度向量方向相反)
+        dot_product = delta_x * rel_vx + delta_y * rel_vy
 
-        # 计算归一化距离
-        dists_norm = torch.sqrt((others_x - ego_x.unsqueeze(1)) ** 2 + (others_y - ego_y.unsqueeze(1)) ** 2)
+        # 将速度投影到距离方向上, 只关心连线方向上的速度 > 0 为远离， < 0 为靠近
+        # 取反，变成正数表示靠近速度
+        closing_speed = -dot_product / dists
 
-        # 还原真实距离 (highway-env 坐标范围 approx 100)
-        dists_real = dists_norm * 100.0
+        # 构建掩码
+        # 判断真车：距离 > 0.1米 认为是真车，0.0 是填充位
+        is_not_padding = dists > 0.1
+        # 判断碰撞，Reward 会给惩罚，Risk 此时应该设为 0，避免干扰 Beta 的学习
+        is_not_crashed = dists > 0.6
+        # 综合有效掩码: 既不是填充，也不是已经撞上的烂摊子
+        valid_mask = is_not_padding & is_not_crashed
+        # 只计算 "正在靠近，速度显著" 且 "有效目标" 的情况
+        is_closing = (closing_speed > 0.05) & valid_mask
 
-        # 过滤 Ghost Vehicles (距离极近通常是 padding 0,0)
-        valid_mask = dists_norm > 0.001
-        dists_real_masked = dists_real.clone()
-        dists_real_masked[~valid_mask] = float('inf')
+        # TTC = dist / speed
+        # Risk = threshold / TTC = threshold * speed / dist
+        # 设定安全分母 (防止除以极小数)
+        dists = torch.clamp(dists, min=0.5)
+        ttc_risk = torch.zeros_like(dists)
+        ttc_risk[is_closing] = ttc_threshold * closing_speed[is_closing] / dists[is_closing]
 
-        # 找到最近的前车距离
-        min_dist, _ = torch.min(dists_real_masked, dim=1)
+        # 保底计算距离风险: 即使相对静止，贴太近也是高风险
+        dist_risk = torch.zeros_like(dists)
+        dist_risk[valid_mask] = 20.0 / dists[valid_mask]
 
-        # --- [关键修改] 线性映射风险 ---
-        safe_threshold = 30.0
-        danger_threshold = 5.0
+        # 计算综合风险
+        total_risk = torch.max(ttc_risk, dist_risk)
+        total_risk = total_risk * valid_mask.float()       # 确认强制把无效位置归零
 
-        # 线性插值: (30 - dist) / (30 - 5)
-        # 当 dist=30, risk=0; 当 dist=5, risk=1
-        risk = (safe_threshold - min_dist) / (safe_threshold - danger_threshold)
+        # 找出每个样本中，周围最危险的那辆车
+        max_total_risk, _ = torch.max(total_risk, dim=1)
 
-        # 截断到 [0, 1] 区间
-        risk = torch.clamp(risk, 0.0, 1.0)
+        # [核心] 数值归一化映射 ---
+        # 优化线性截断，用 tanh 函数做软饱和，尽量避免使用 clamp 做硬截断
+        # 逻辑:
+        #   Risk=0 -> 0.0
+        #   Risk=5 (距离4米) -> 0.5 (中等危险)
+        #   Risk=20 (贴脸) -> 接近 1.0 (极度危险)
 
-        # 处理 NaN (如果没有其他车辆)
-        risk = torch.nan_to_num(risk, nan=0.0)
+        # 固定物理缩放系数（0.2），不再调整
+        #   距离 10m (Raw=2) -> tanh(0.4) = 0.38 (低风险)
+        #   距离 5m  (Raw=4) -> tanh(0.8) = 0.66 (中高风险)
+        #   距离 2m  (Raw=10)-> tanh(2.0) = 0.96 (极高风险)
+        normalized_risk = torch.tanh(max_total_risk * 0.2)
 
-        return risk.mean().item()
+        return normalized_risk.mean().item()
+
+
+    def calculate_group_advantages(self, group_trajectories):
+        """
+        纯数学计算函数。
+        Args:
+            group_trajectories: List[List[Tuple]], 原始轨迹数据 (Worker 采集的)
+        Returns:
+            normalized_advantages: np.array, 形状为 (Group_Size,)
+                对应每条轨迹的 Advantage 值。
+            group_mean: float
+                组平均回报 (用于日志)。
+        """
+        group_returns = []
+        group_crashed = []  # 新增：记录每条轨迹是否最终撞车
+
+        # 1. 计算每条轨迹的 Monte-Carlo Return
+        for traj in group_trajectories:
+            G = 0
+            crashed = False
+            # tuple 结构是 (s, a, r, ns, d, lp)，索引 2 是 reward
+            for t in reversed(range(len(traj))):
+                r = traj[t][2]
+                # 判定撞车：根据 reward 阈值或者 done 状态
+                # 假设你的环境 collision_reward 是 -20
+                if r <= -10.0:
+                    crashed = True
+                G = r + self.gamma * G
+            group_returns.append(G)
+            group_crashed.append(crashed)
+
+        # 2. 归一化计算
+        group_returns_arr = np.array(group_returns)
+        group_mean = group_returns_arr.mean()
+        group_std = group_returns_arr.std() + 1e-8
+
+        # 计算标准化优势 (GRPO 核心公式)
+        # 结果是一个列表，例如: [0.5, -1.2, 0.8, ...]，对应第 0, 1, 2... 条轨迹
+        normalized_advantages = (group_returns_arr - group_mean) / group_std
+
+        # 3. [关键优化] 绝对惩罚掩码
+        # 如果这条轨迹撞车了，无论它相对于平均值如何，强制它的优势为负
+        for i in range(len(normalized_advantages)):
+            if group_crashed[i]:
+                # 如果归一化后是正的（误判），强行打压为负数
+                # -1.0 代表比平均水平差一个标准差，是一个合理的惩罚基准
+                if normalized_advantages[i] > -0.5:
+                    normalized_advantages[i] = -1.0
+
+        return normalized_advantages, group_mean
 
     def learn(self, current_total_timesteps):
-        # 获取数据: advantages 字段存储的是 Worker 算好的 Group Advantage
+        # [核心修正]
+        # get_all_and_clear 返回的第三个参数原本是 rewards，现在存储的是 advantages
         states, actions, advantages, next_states, dones, logprobs = self.memory.get_all_and_clear()
 
-        if states is None or len(states) < self.bs: return
+        if states is None or len(states) < self.bs:
+            return
 
         states = states.to(self.device)
         actions = actions.to(self.device)
-        advantages = advantages.to(self.device)
+        advantages = advantages.to(self.device)  # 这是 Worker 算好的相对优势
         logprobs = logprobs.to(self.device)
 
         # Clip Advantage 保证数值稳定
         advantages = torch.clamp(advantages, -4.0, 4.0)
 
-        # --- [关键修改] 反转的动态 Beta 更新逻辑 ---
+        # 动态 Beta 更新逻辑
         if self.use_dynamic_beta:
             current_risk = self.calculate_risk(states)
+            print(f" | current_risk: {current_risk} | ")
 
-            # 新逻辑：Risk 越高 (危险)，Beta 越小 (放松约束)
-            # 目的：允许策略大幅更新以逃离危险状态
-            target_beta = self.beta_init * (1.0 - current_risk)
-
-            # 确保 Beta 不会变成 0 (保留微弱的 Trust Region)
+            # 使用反比例公式，保证 Beta 永远 > 0
+            # 敏感度因子 risk_sensitivity 建议值:
+            #   5.0  -> 危险时(Risk=1), Beta 降为原来的 1/6 (适中)
+            #   10.0 -> 危险时(Risk=1), Beta 降为原来的 1/11 (激进，允许剧烈改变)
+            risk_sensitivity = 10.0
+            target_beta = self.beta_init / (1.0 + risk_sensitivity * current_risk)
             self.beta = max(target_beta, self.beta_min)
         else:
-            self.beta = self.beta_init
+            self.beta = self.beta_init  # 消融实验会一直跑这里
 
         # 学习率衰减
         decay = self.dr ** (current_total_timesteps // self.decay_step_size)
-        for pg in self.optimizer.param_groups: pg['lr'] = self.lr * decay
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = self.lr * decay
 
         # PPO Update Loop
         dataset_size = states.size(0)
@@ -165,22 +245,20 @@ class Agent_GRPO:
                 mb_states = states[idx]
                 mb_actions = actions[idx]
                 mb_old_log = logprobs[idx]
-                mb_adv = advantages[idx]
+                mb_adv = advantages[idx]  # 直接使用
 
                 action_probs = self.actor(mb_states)
                 dist = torch.distributions.Categorical(action_probs)
                 mb_new_log = dist.log_prob(mb_actions)
                 dist_entropy = dist.entropy().mean()
 
-                ratio = torch.exp(mb_new_log - mb_old_log)
-
                 with torch.no_grad():
                     approx_kl = 0.5 * ((mb_new_log - mb_old_log) ** 2).mean()
 
+                ratio = torch.exp(mb_new_log - mb_old_log)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
 
-                # Loss = PPO_Loss + Beta * KL - Entropy
                 loss = -torch.min(surr1, surr2).mean() + \
                        self.beta * approx_kl - \
                        self.entropy_coef * decay * dist_entropy
@@ -190,7 +268,8 @@ class Agent_GRPO:
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                 self.optimizer.step()
 
-        self.entropy = dist_entropy.item()
+        self.entropy = dist_entropy.item()          # 策略熵
+        print(f" | approx_kl: {approx_kl} | ")      # 最后一次的 approx_kl
 
     def get_state_dict(self):
         return {'actor': self.actor.state_dict()}

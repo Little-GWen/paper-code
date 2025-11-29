@@ -8,17 +8,17 @@ GPU = 0
 DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "cpu")
 
 # 环境名
-RAM_ENV_NAME = 'highway-v0'
+RAM_ENV_NAME = 'my-highway-v0'
 
 # 训练参数
 # [优化] 增大 Batch Size 以稳定梯度估计
-NUM_PROCESSES = 10
-BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
-LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
+NUM_PROCESSES = 15
+BATCH_SIZE = 1024
+LEARNING_RATE = 1e-4
 
 # 衰减参数
-DECAY_RATE = 0.995
-DECAY_STEP_SIZE = 10000
+DECAY_RATE = 0.999
+DECAY_STEP_SIZE = 2048
 
 # 算法通用参数
 GAMMA = 0.985
@@ -26,13 +26,15 @@ TAU = 0.001
 
 # PPO/GRPO 特有参数
 LAMDA = 0.95
-EPS_CLIP = 0.2           # 原 0.3，稍微保守一点
-K_EPOCHS = 10            # 原 6，数据利用率稍微提高
+EPS_CLIP = 0.2
+K_EPOCHS = 10
 CRITIC_LOSS_COEF = 0.5
-ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
+PPO_ENTROPY_COEF = 0.01
+GRPO_ENTROPY_COEF = 0.001   # GRPO 必须比 PPO 更低，否则它不敢确定策略
+GROUP_SIZE = 16
 
 # 训练时长
-RAM_NUM_EPISODE = 40000  # 稍微增加总轮次
+RAM_NUM_EPISODE = 20000
 MAX_T = 1000
 
 # 可视化参数

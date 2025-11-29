@@ -42,7 +42,8 @@ class Replay_Buffer:
         dones = torch.tensor(np.array(dones), dtype=torch.float32)
         if log_probs[0] is not None:
             log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32)
-        else: log_probs = None
+        else:
+            log_probs = None
         return states, actions, rewards, next_states, dones, log_probs
 
     def clear(self):
