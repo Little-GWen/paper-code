@@ -1,12 +1,10 @@
 import sys, os, argparse
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import numpy as np
 from multiprocessing import Manager
-import gym, torch
+import gymnasium as gym
 from models.agent_dqn import Agent_DQN
 from config import *
-import custom_env
 
 
 def parse_args():

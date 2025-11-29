@@ -5,7 +5,7 @@ from multiprocessing import Value
 import time
 import gymnasium as gym
 import torch.multiprocessing as mp
-from models.agent_ppo import Agent_PPO
+from models.agent_ppo_safe import Agent_PPO_Safe
 from config import *
 
 
@@ -16,7 +16,8 @@ def parse_args():
 
 
 def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
     weights_path = os.path.join(save_dir, 'weights.pth')
     param_queue = manager.Queue(maxsize=num_processes)
     stop_event = manager.Event()
@@ -38,7 +39,8 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
         processes.append(p)
 
     initial_state_dict = agent.get_state_dict()
-    for _ in range(num_processes): param_queue.put(initial_state_dict)
+    for _ in range(num_processes):
+        param_queue.put(initial_state_dict)
 
     last_log_time, update_count = time.time(), 0
     try:
@@ -48,7 +50,7 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
                     agent.learn(global_step.value);
                     update_count += 1
                     if time.time() - last_log_time > 5:
-                        print(f"[PPO] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f}")
+                        print(f"[PPO_Safe] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f} | Beta {agent.beta:.6f}")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
@@ -56,8 +58,10 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
                         np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
                         np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
                 new_state_dict = agent.get_state_dict()
-                while not param_queue.empty(): param_queue.get()
-                for _ in range(num_processes): param_queue.put(new_state_dict)
+                while not param_queue.empty():
+                    param_queue.get()
+                for _ in range(num_processes):
+                    param_queue.put(new_state_dict)
             time.sleep(0.1)
     finally:
         stop_event.set();
@@ -73,7 +77,7 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
                   stop_event, max_t, save_lock, rewards_log, speed_log, collision_log):
     env = gym.make(env_id)
     state_dim = int(np.prod(env.observation_space.shape))
-    local_agent = Agent_PPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
+    local_agent = Agent_PPO_Safe(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE,
                             GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, PPO_ENTROPY_COEF, DEVICE, shared=False,
                             manager=None, is_worker=True)
     try:
@@ -96,7 +100,8 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
             with global_step.get_lock():
                 global_step.value += 1
             steps += 1
-            if len(state) >= 3: ep_speed += state[2]
+            if len(state) >= 3:
+                ep_speed += state[2]
             state_tensor = torch.FloatTensor(state).to(local_agent.device)
             action, log_prob = local_agent.act(state_tensor)
             res = env.step(action)
@@ -106,7 +111,8 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
                 next_state, reward, done, info = res
             done = term or trunc if len(res) == 5 else done
 
-            if info.get('crashed', False): is_crashed = 1
+            if info.get('crashed', False):
+                is_crashed = 1
 
             next_state = next_state.flatten()
             shared_memory.remember((state, action, reward, next_state, done, log_prob))
@@ -129,13 +135,13 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     args = parse_args()
     set_seed(args.seed)
-    save_dir = f'results/ppo/seed_{args.seed}'
+    save_dir = f'results/ppo_safe/seed_{args.seed}'
     with mp.Manager() as manager:
         dummy = gym.make(RAM_ENV_NAME)
         state_dim = int(np.prod(dummy.observation_space.shape))
         act_dim = dummy.action_space.n
         dummy.close()
-        agent = Agent_PPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA, LAMDA,
+        agent = Agent_PPO_Safe(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, GAMMA, LAMDA,
                           EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, PPO_ENTROPY_COEF, DEVICE, shared=False, manager=manager,
                           is_worker=False)
         main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
