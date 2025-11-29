@@ -1,61 +1,24 @@
-更新日志 (Changelog)
-
-本项目旨在将组相对策略优化 (GRPO) 算法应用于自动驾驶场景，并引入风险感知的动态约束机制。以下是针对算法逻辑、环境配置及代码稳定性的主要更新记录。
-
-[2025-11-24] - 核心算法重构与环境修复
-
-🚀 核心算法更新 (Core Algorithm Updates)
-
-引入同状态组采样 (Same-State Group Sampling):
-
-为了解决 GRPO 在高随机性交通流中估值方差过大的问题，重写了 train_grpo.py 和 train_grpo_ablation.py 中的采样逻辑。
-
-机制: 每次采集一组 (GROUP_SIZE=4) 轨迹时，强制使用相同的随机种子 (env.reset(seed=group_seed)) 重置环境。
-
-目的: 确保组内轨迹面临完全相同的初始路况，从而使优势函数 (Advantage) 的计算基于策略本身的差异，而非环境的随机性。
-
-完善动态风险机制 (Dynamic Risk Mechanism):
-
-在 models/agent_grpo.py 中补全了 calculate_risk 函数。
-
-实现了基于周围车辆距离的动态 Beta 调整逻辑：风险越高（距离越近），KL 散度惩罚系数 (self.beta) 越大，强制策略保守更新。
-
-🛠 环境与奖励函数优化 (Environment & Rewards)
-
-奖励函数重塑 (Reward Shaping):
-
-碰撞惩罚: 从激进的 -300.0 调整为 -50.0，降低稀疏负奖励对训练的打击。
-
-距离惩罚: 将原本不稳定的倒数惩罚 (1/d) 改为线性惩罚 (-1.0 * (1 - d/25.0))，防止车辆过近时产生数值爆炸。
-
-正向引导: 增加了归一化的速度奖励和存活奖励，确保在无碰撞情况下 Agent 能获得正向收益，解决训练曲线长期为负的问题。
-
-Gym 兼容性修复:
-
-在 custom_env.py 的注册代码中移除了 max_episode_steps=1000 参数。
-
-解决问题: 修复了 test_model.py 中出现的 ValueError: too many values to unpack 错误，防止 Gym 自动添加不兼容的旧版 TimeLimit 包装器。
-
-🐛 Bug 修复 (Bug Fixes)
-
-Agent 属性缺失修复:
-
-在 models/agent_grpo.py 的 __init__ 方法中补充了 self.eps_clip = eps_clip。
-
-解决问题: 修复了训练时报错 AttributeError: 'Agent_GRPO' object has no attribute 'eps_clip'。
-
-消融实验对齐:
-
-更新了 experiments/train_grpo_ablation.py，使其与主实验采用完全相同的“同状态组采样”策略，仅关闭动态 Beta 功能 (use_dynamic_beta=False)，确保实验对比的公平性和有效性。
-
-[实验指南] 接下来的步骤
-
-清理旧数据: 建议删除 results/ 文件夹下的旧日志，避免不同奖励尺度的数据混淆。
-
-运行主实验: python experiments/train_grpo.py --seed 1
-
-运行消融实验: python experiments/train_grpo_ablation.py --seed 1
-
-运行基线 (PPO): python experiments/train_ppo.py --seed 1
-
-绘图: 使用 analysis/plot_learning_curves.py 查看对比结果（预期 GRPO 曲线将稳步上升且优于消融版本）。
+📅 项目更新日志：GRPO 算法与 Highway 环境深度优化版
+  版本摘要：本次更新集中解决了 GRPO 算法在自动驾驶场景中“收敛慢”、“不敢超车”以及“对幽灵车辆误判”的核心问题。通过重构风险计算逻辑（TTC Fusion）、优化动态 Beta 约束机制以及调整环境奖励函数，实现了在保证安全的前提下显著提升行驶速度和训练稳定性。
+🛠️ 1. 环境层优化 (Environment - custom_env.py)
+  💰 奖励函数重构 (Reward Shaping)
+    降低存活奖励：从 1.0 降至 0.5。降低“苟活”的收益权重，倒逼智能体通过“高速行驶”来获取高分。
+    消除低速死区：速度奖励范围从 [20, 30] 放宽至 [10, 30]。让智能体在低速起步阶段也能获得正反馈，避免因起步无奖励而陷入停滞。
+    减小 duration：将 duration 减小到200，让智能体更容易活到最后, 建立正向反馈循环
+  🐛 兼容性与注册修复
+    Gymnasium 迁移：彻底修复 gym 与 gymnasium 的混用问题，元数据键名更新为 render_modes 和 render_fps，消除所有黄色警告。
+    注册表冲突修复：环境 ID 更名为 my-highway-v0 并增加 if not in registry 检查，彻底解决多进程 (multiprocessing) 下的重复注册报错。
+🧠 2. 算法层升级 (Agent - models/agent_grpo.py)
+  🛡️ 风险感知系统重构 (Physics-Aware Risk)
+    TTC + 距离融合：摒弃单纯的距离判断，引入 TTC (Time-to-Collision) 逻辑。允许在相对静止时近距离跟车（低风险），但在高速对冲时提前预警（高风险）。
+    幽灵车辆过滤 (Ghost Masking)：修复了填充数据（坐标 0,0）导致 Risk 爆表的问题。增加了 dist > 0.1 和 dist > 0.6 的双重掩码，过滤掉 Padding 数据和已碰撞数据。
+    Tanh 归一化映射：使用 tanh(raw_risk * 0.2) 将物理风险平滑映射到 [0, 1] 区间，避免梯度突变。
+  📉 动态 Beta 机制反转 (Inverse Beta Decay)
+    逻辑反转：从“越危险越保守”改为“越危险越激进”。新公式：$\beta = \beta_{init} / (1 + Risk)$。当检测到高风险时，大幅降低 KL 散度约束，允许策略网络剧烈更新（如急刹、急转）以进行紧急避险。
+  📉 优势函数修正
+    代码优化：将优势函数计算移动到 models/agent_grpo.py 中，定义为 calculate_group_advantages，将 GROUP_SIZE 移动到 config 中，增强代码的可读性与可维护性。
+    绝对失败惩罚：在 calculate_group_advantages 中加入逻辑，若轨迹发生碰撞，无论其在组内排名如何，Advantage 强制设为负值，防止 GRPO 出现“比烂”现象。
+⚙️ 3. 超参数调优 (Config - config.py)
+  🚀 训练加速与收敛
+    区分熵系数：将 GRPO 与 PPO 熵系数分开为 GRPO_ENTROPY_COEF = 0.001 与 PPO_ENTROPY_COEF = 0.01。解决了 GRPO 因缺乏 Critic 指引而导致的“犹豫不决”（高熵值停滞）问题。
+    学习率策略调整：DECAY_RATE 提升至 0.9999，减缓衰减速度，确保训练后期仍有足够的梯度更新动力。
