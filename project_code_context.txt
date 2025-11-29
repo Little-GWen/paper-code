@@ -21,11 +21,11 @@ BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
 LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
 
 # 衰减参数
-DECAY_RATE = 0.999
-DECAY_STEP_SIZE = 50000
+DECAY_RATE = 0.99
+DECAY_STEP_SIZE = 10000
 
 # 算法通用参数
-GAMMA = 0.99
+GAMMA = 0.985
 TAU = 0.001
 
 # PPO/GRPO 特有参数
@@ -36,7 +36,7 @@ CRITIC_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
 
 # 训练时长
-RAM_NUM_EPISODE = 10000  # 稍微增加总轮次
+RAM_NUM_EPISODE = 25000  # 稍微增加总轮次
 MAX_T = 1000
 
 # 可视化参数
@@ -165,11 +165,12 @@ from highway_env.road.road import Road, RoadNetwork
 from highway_env.vehicle.controller import ControlledVehicle
 from highway_env.vehicle.kinematics import Vehicle
 
+
 class HighwayEnv(AbstractEnv):
     """
-    优化版 HighwayEnv:
-    1. 修正 Observation 顺序为 Fixed，确保 Agent 能正确识别 Ego Vehicle。
-    2. 调整奖励函数，避免 Early Stopping 问题。
+    优化版 HighwayEnv (ROI + GRPO Aggressive):
+    1. ROI策略: 物理生成15辆车，Obs只看5辆车。
+    2. 激进奖励: 即使有高额碰撞惩罚，也通过超高速度奖励诱导Agent加速。
     """
     metadata = {'render.modes': ['human', 'rgb_array'], "video.frames_per_second": 15}
 
@@ -183,25 +184,35 @@ class HighwayEnv(AbstractEnv):
         config.update({
             "observation": {
                 "type": "Kinematics",
-                "vehicles_count": 15,
+                # [关键变量 B] 神经网络输入维度
+                # 5 = 1(Ego) + 4(Neighbors)
+                # 作用：ROI (Region of Interest)，只关注身边最近的威胁，过滤远处的噪声
+                "vehicles_count": 5,
                 "features": ["x", "y", "vx", "vy", "heading"],
+                # 移除手动 range，防止归一化截断
                 "features_range": {
                     "x": [-100, 100], "y": [-100, 100], "vx": [-20, 20], "vy": [-20, 20]
                 },
                 "absolute": False,
-                # [关键修正] 改为 fixed，保证 obs[0] 永远是 Ego Vehicle
-                # 这样 models/agent_grpo.py 里的 calculate_risk 才能算对
                 "order": "fixed"
             },
             "action": {"type": "DiscreteMetaAction"},
             "lanes_count": 4,
-            "vehicles_count": 15,
+
+            # [关键变量 A] 物理世界生成车辆数
+            # 15 = 相当拥堵。配合 short spawn length，制造高难度博弈环境
+            "vehicles_count": 10,
+
+            # [关键] 生成范围缩短，增加密度
+            # 15辆车挤在300米内 = 真正的“泥石流”路况
             "traffic_spawn_length": 600,
+
             "initial_ego_speed": 25,
             "initial_traffic_speed": 20,
-            "duration": 600,
-            # [关键修正] 奖励调整
-            "collision_reward": -50.0,  # 原 -50，太重了会导致模型不敢动
+            "duration": 500,  # 缩短单局时间，加快采样节奏
+
+            # [关键] 奖励重塑
+            "collision_reward": -200.0,  # 只要撞车，直接判负
             "reward_speed_range": [20, 35],
             "offroad_terminal": False
         })
@@ -233,20 +244,23 @@ class HighwayEnv(AbstractEnv):
         self.road.vehicles.append(controlled_vehicle)
         self.vehicle = self.controlled_vehicles[0]
 
+        # [变量 A] 在这里生效：生成 15 辆车
         vehicles_to_create = self.config["vehicles_count"] - 1
         spawn_len = self.config.get("traffic_spawn_length", 400)
 
         for _ in range(vehicles_to_create):
-            for _ in range(50):
+            for _ in range(50):  # 尝试 50 次防止重叠
                 lid = self.np_random.integers(0, self.config["lanes_count"])
+                # 在 Ego 前后随机生成
                 x = self.np_random.uniform(0, spawn_len) + ego_pos - 50
                 valid = True
                 for v in self.road.vehicles:
-                    if np.linalg.norm(v.position - [x, 0]) < 15:
+                    if np.linalg.norm(v.position - [x, 0]) < 10:  # 稍微允许紧凑一点
                         valid = False
                         break
                 if valid:
                     lane = self.road.network.get_lane(("0", "1", lid))
+                    # 随机速度，增加博弈
                     spd = 20 + self.np_random.uniform(-5, 5)
                     veh = other_vehicles_type(self.road, position=lane.position(x, 0), heading=lane.heading_at(x),
                                               speed=spd)
@@ -255,30 +269,36 @@ class HighwayEnv(AbstractEnv):
                     break
 
     def _reward(self, action: Action) -> float:
-        # 1. 碰撞惩罚
+        # 1. 碰撞惩罚 (重罚)
         if self.vehicle.crashed:
             return self.config["collision_reward"]
 
-        # 2. 高速奖励 (放大权重)
+        # 2. 高速奖励 (GRPO 激进诱导)
+        # 归一化到 [0, 1]
         scaled_speed = utils.lmap(self.vehicle.speed, self.config["reward_speed_range"], [0, 1])
-        r_speed = np.clip(scaled_speed, 0, 1) * 2.0  # 满速得 2 分
 
-        # 3. 存活奖励 (放大权重)
-        r_survival = 1.0  # 只要活着就一直加分
+        # [关键修改] 权重设为 5.0！
+        # 告诉 Agent：如果你不全速跑，就算活着也没意义！
+        r_speed = np.clip(scaled_speed, 0, 1) * 5.0
 
-        # 4. 变道惩罚
+        # 3. 存活奖励 (降低低保)
+        # 逼迫它动起来
+        r_survival = 0.2
+
+        # 4. 变道惩罚 (轻微惩罚，防止抽搐)
         r_lane_change = 0
         if action in [0, 2]:
-            r_lane_change = -0.1
+            r_lane_change = -0.05
 
-        # 5. 距离保持
+        # 5. 距离保持 (前车安全距离)
         r_dist = 0
         front_vehicle = self._get_front_vehicle()
         if front_vehicle:
             d = np.linalg.norm(self.vehicle.position - front_vehicle.position)
-            if d < 25:
+            # 安全距离阈值设为 30米
+            if d < 30:
                 # 距离越近扣分越多，最大扣 1.0
-                r_dist = -1.0 * (1 - d / 25.0)
+                r_dist = -1.0 * (1 - d / 30.0)
 
         return r_speed + r_survival + r_lane_change + r_dist
 
@@ -299,6 +319,7 @@ class HighwayEnv(AbstractEnv):
     def _cost(self, action: int) -> float:
         return float(self.vehicle.crashed)
 
+
 register(
     id='highway-v0',
     entry_point='custom_env:HighwayEnv',
@@ -314,143 +335,130 @@ import pandas as pd
 import seaborn as sns
 
 RESULTS_DIR = '../results'
+SAVE_DIR = '../analysis'
 
-# 定义实验配置，包含 step_scale (X轴缩放倍率)
+# 定义实验配置
 experiments_config = {
-    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 4},  # 关键：GRPO 1步顶4步
-    'PPO (Baseline)': {'folder': 'ppo', 'step_scale': 1},  # PPO 1步就是1步
-    'GRPO (Ablation)': {'folder': 'grpo_no_dynamic', 'step_scale': 4},
-    'DQN (Baseline)': {'folder': 'dqn', 'step_scale': 1}
+    # [关键] PPO 每次更新1个ep，GRPO 每次更新8个ep。
+    # 为了在图上公平对比，GRPO 的 step_scale 必须是 8。
+    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 16, 'color': '#1f77b4'},
+    'PPO (Baseline)': {'folder': 'ppo', 'step_scale': 1, 'color': '#ff7f0e'},
+    'GRPO (Ablation)': {'folder': 'grpo_no_dynamic', 'step_scale': 16, 'color': '#2ca02c'},
 }
 
 
-def get_data(label, config, filename='rewards.npy', transform=None):
-    """
-    通用数据读取函数
-    filename: 'rewards.npy' 或 'collision.npy' 或 'speed.npy'
-    transform: 一个函数，用于对原始数据进行变换 (例如 lambda x: 1 - x)
-    """
+def load_data_robust(label, config, metric_type):
     folder = config['folder']
     step_scale = config['step_scale']
-
     path = os.path.join(RESULTS_DIR, folder)
-    if not os.path.exists(path):
-        # print(f"⚠️  文件夹未找到 (跳过): {path}")
-        return None
 
+    if not os.path.exists(path): return None
     all_dfs = []
-
-    # 遍历所有种子
     seed_folders = [d for d in os.listdir(path) if d.startswith('seed_')]
-    if not seed_folders: return None
 
     for seed_folder in seed_folders:
-        file_path = os.path.join(path, seed_folder, filename)
-        if os.path.exists(file_path):
-            try:
-                data = np.load(file_path)
+        try:
+            reward_path = os.path.join(path, seed_folder, 'rewards.npy')
+            collision_path = os.path.join(path, seed_folder, 'collision.npy')
+            speed_path = os.path.join(path, seed_folder, 'speed.npy')
 
-                # [新增] 数据转换逻辑 (例如计算非碰撞率)
-                if transform is not None:
-                    data = transform(data)
+            if metric_type == 'speed':
+                if os.path.exists(speed_path):
+                    data = np.load(speed_path)
+                    # [关键] 还原真实速度 (归一化值 * 20 m/s)
+                    data = data * 20.0
+                    data_smooth = pd.Series(data).rolling(window=50, min_periods=1).mean().values
+                    steps = np.arange(len(data_smooth)) * step_scale
+                    all_dfs.append(pd.DataFrame({'Episode': steps, 'Value': data_smooth, 'Algorithm': label}))
+                continue
 
-                # 数据平滑 (Window Size 可调)
-                # 对于 Safety Rate，稍微平滑一点好看
-                window_size = 100 if 'collision' in filename else 50
-                data_smooth = pd.Series(data).rolling(window=window_size, min_periods=1).mean().values
+            if not os.path.exists(reward_path): continue
+            rewards = np.load(reward_path)
 
-                # 构建 DataFrame
-                # [关键逻辑] X轴 = 索引 * 缩放倍率
-                steps = np.arange(len(data_smooth)) * step_scale
+            collisions = None
+            if os.path.exists(collision_path):
+                try:
+                    loaded = np.load(collision_path)
+                    if len(loaded) > 0: collisions = loaded
+                except:
+                    pass
 
-                df_seed = pd.DataFrame({
-                    'Episode': steps,
-                    'Value': data_smooth,
-                    'Algorithm': label
-                })
-                all_dfs.append(df_seed)
-            except:
-                print(f"❌ 读取错误: {file_path}")
+            if collisions is None:
+                collisions = np.where(rewards < -50.0, 1.0, 0.0)  # 修正判定阈值
 
-    if not all_dfs: return None
-    return pd.concat(all_dfs, ignore_index=True)
+            min_len = min(len(rewards), len(collisions))
+            rewards = rewards[:min_len]
+            collisions = collisions[:min_len]
+
+            win_size = 100
+
+            if metric_type == 'safety_rate':
+                final_data = 1.0 - collisions  # 0=Crash -> 1=Safe
+                win_size = 150
+
+            elif metric_type == 'weighted_reward':
+                is_safe = 1.0 - collisions
+                final_data = rewards * is_safe
+
+            elif metric_type == 'reward':
+                final_data = rewards
+
+            data_smooth = pd.Series(final_data).rolling(window=win_size, min_periods=1).mean().values
+            steps = np.arange(len(data_smooth)) * step_scale
+
+            all_dfs.append(pd.DataFrame({
+                'Episode': steps,
+                'Value': data_smooth,
+                'Algorithm': label
+            }))
+
+        except Exception as e:
+            print(f"⚠️ 跳过 {seed_folder}: {e}")
+
+    return pd.concat(all_dfs, ignore_index=True) if all_dfs else None
 
 
-def plot_metric(metric_name, filename, ylabel, title, save_name, transform=None, y_limit=None):
-    """
-    通用画图函数
-    """
-    plt.figure(figsize=(10, 6))
-    sns.set_theme(style="whitegrid")
+def plot_paper_graph(metric_type, title, ylabel, filename, y_limit=None):
+    plt.figure(figsize=(8, 5))
+    sns.set_theme(style="whitegrid", font_scale=1.1)
 
     all_data = []
     for label, config in experiments_config.items():
-        df = get_data(label, config, filename, transform)
+        df = load_data_robust(label, config, metric_type)
         if df is not None:
             all_data.append(df)
 
     if not all_data:
-        print(f"❌ 没有找到 {metric_name} 数据")
+        print(f"❌ 无法绘制 {metric_type}")
         return
 
-    # 合并所有数据画图
     final_df = pd.concat(all_data, ignore_index=True)
+    palette = {k: v['color'] for k, v in experiments_config.items() if k in final_df['Algorithm'].unique()}
 
-    # 绘制带置信区间的曲线
-    sns.lineplot(data=final_df, x='Episode', y='Value', hue='Algorithm', linewidth=2.0)
+    sns.lineplot(
+        data=final_df, x='Episode', y='Value', hue='Algorithm',
+        palette=palette, linewidth=2.5, alpha=0.9
+    )
 
-    plt.title(title, fontsize=15, fontweight='bold')
+    plt.title(title, fontsize=14, fontweight='bold', pad=12)
     plt.xlabel("Training Episodes (Equivalent)", fontsize=12)
     plt.ylabel(ylabel, fontsize=12)
-
-    if y_limit:
-        plt.ylim(y_limit)
-
-    plt.legend(fontsize=11, loc='best')
+    if y_limit: plt.ylim(y_limit)
+    plt.legend(frameon=True, fancybox=True, framealpha=0.9, fontsize=10, loc='best')
+    plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
 
-    # 保存图片
-    save_path = os.path.join('analysis', save_name)
-    if not os.path.exists('analysis'): os.makedirs('analysis')
-    plt.savefig(save_path, dpi=300)
-    print(f"\n✅ {metric_name} 图表已保存至 {save_path}")
+    if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
+    plt.savefig(os.path.join(SAVE_DIR, filename), dpi=300, bbox_inches='tight')
+    print(f"✅ Saved: {filename}")
 
 
 if __name__ == "__main__":
-    print("📊 正在绘制训练曲线...")
-
-    # 1. 绘制 Reward 曲线
-    plot_metric(
-        metric_name="Reward",
-        filename="rewards.npy",
-        ylabel="Average Reward",
-        title="Training Performance (Reward)",
-        save_name="learning_curve_reward.png"
-    )
-
-    # 2. 绘制 非碰撞率 (Safety Rate) [核心修改]
-    # 使用 lambda x: 1 - x 将 碰撞(1) 转换为 安全(0)，反之亦然
-    # 注意：原始数据中 1=Crashed, 0=Safe。所以 1-x 后，1=Safe, 0=Crashed。
-    plot_metric(
-        metric_name="Safety Rate",
-        filename="collision.npy",
-        ylabel="Safety Rate (Higher is Better)",
-        title="Safety Performance (No-Collision Rate)",
-        save_name="learning_curve_safety_rate.png",
-        transform=lambda x: 1.0 - x,  # <--- 这里的魔法
-        y_limit=(0.0, 1.05)  # 固定 Y 轴范围
-    )
-
-    # 3. 绘制 Speed 曲线
-    plot_metric(
-        metric_name="Average Speed",
-        filename="speed.npy",
-        ylabel="Avg Speed (m/s)",
-        title="Driving Efficiency (Speed)",
-        save_name="learning_curve_speed.png"
-    )
-
-    print("\n🎉 所有图表绘制完成！请查看 analysis/ 文件夹。")
+    print("🎨 Generating Plots...")
+    plot_paper_graph('safety_rate', 'Safety Performance (Survival Rate)', 'Safety Rate', 'fig1_safety.png', (0.0, 1.05))
+    plot_paper_graph('weighted_reward', 'Effective Performance', 'Reward (Zero on Crash)', 'fig2_effective.png')
+    plot_paper_graph('speed', 'Driving Efficiency', 'Speed (m/s)', 'fig3_speed.png')
+    plot_paper_graph('reward', 'Raw Training Reward', 'Reward', 'fig4_raw_reward.png')
 
 ====================
 FILE: ./analysis/analyze_convergence.py
@@ -734,8 +742,8 @@ from models.agent_grpo import Agent_GRPO
 from config import *
 import custom_env
 
-# 组大小 (Sample G trajectories for same state)
-GROUP_SIZE = 4
+# --- [关键修改] 增大组大小，提升多样性 ---
+GROUP_SIZE = 16  # 原 8 -> 16，增加幸存者概率
 
 
 def parse_args():
@@ -760,7 +768,7 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
 
     processes = []
     for pid in range(num_processes):
-        # [主实验] 默认 use_dynamic_beta=True (在 Agent 初始化中设置)
+        # [主实验] 默认 use_dynamic_beta=True
         p = mp.Process(target=sample_worker, args=(
             env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
             stop_event, max_t, save_lock, rewards_log, speed_log, collision_log))
@@ -773,13 +781,14 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
     last_log_time, update_count = time.time(), 0
     try:
         while global_episode.value < total_episodes:
-            # 等待足够的数据 (Batch Size * Group Size 确保可以进行几次完整的组更新)
-            if len(agent.memory) >= BATCH_SIZE * 4:
+            # 确保 Buffer 里有足够的数据 (Batch Size * 2 比较稳妥)
+            if len(agent.memory) >= BATCH_SIZE * 2:
                 with save_lock:
                     agent.learn(global_step.value)
                     update_count += 1
                     if time.time() - last_log_time > 5:
-                        print(f"[GRPO-Main] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f}")
+                        print(
+                            f"[GRPO-v2] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.4f} | Ent {agent.entropy:.3f}")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
@@ -821,14 +830,14 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
         pass
 
     while not stop_event.is_set():
-        # 1. 组采样初始化 (Same-State Logic)
+        # 1. 组采样初始化
         group_seed = random.randint(0, 1000000)
         group_trajectories = []  # 存储轨迹数据
         group_returns = []  # 存储每条轨迹的 Return
 
         # 2. 采集 Group 轨迹
         for _ in range(GROUP_SIZE):
-            # 强制使用相同的种子重置环境
+            # 强制使用相同的种子重置环境 (Same-State)
             state, _ = env.reset(seed=group_seed)
             state = state.flatten()
             ep_reward, ep_speed, steps = 0, 0, 0
@@ -871,27 +880,35 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
             with global_step.get_lock():
                 global_step.value += steps
 
-        # 3. 组内归一化 (GRPO 核心步骤)
-        # 计算这一组内的 Mean 和 Std
+        # 3. 组内归一化 (GRPO 核心改进版)
         group_returns_arr = np.array(group_returns)
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
 
-        # 计算相对优势 (Advantage)
-        normalized_advantages = (group_returns_arr - group_mean) / group_std
+        # --- [关键修改] 防止 Group Collapse (集体平庸) ---
+        # 如果整组平均分极低 (例如都撞了，平均分可能是 -50 到 -100)，
+        # 那么不应该进行组内归一化(因为那会让 -100 变成 0)，
+        # 而是应该强制给一个负的 Advantage，让模型知道“这组不行”。
+
+        CRASH_THRESHOLD = -20.0  # 设定一个阈值，低于此值视为“全组失败”
+
+        if group_mean < CRASH_THRESHOLD:
+            # 绝对惩罚模式：不用减 Mean，直接除以一个常数，保留负值信号
+            normalized_advantages = (group_returns_arr) / 50.0
+        else:
+            # 正常 GRPO 模式：相对优势
+            normalized_advantages = (group_returns_arr - group_mean) / group_std
 
         # 4. 存入 Buffer (用 Advantage 替换 Reward)
         for i, traj in enumerate(group_trajectories):
             group_adv = normalized_advantages[i]
             for step_data in traj:
                 s, a, r, ns, d, lp, G_t = step_data
-                # [关键] 存入 group_adv 到 Buffer 的第三个位置 (原 reward 位)
                 shared_memory.remember((s, a, group_adv, ns, d, lp))
 
         # 5. 公平计数 & 日志
         with episode_lock:
             if global_episode.value < total_episodes:
-                # [关键修正] 计数器 += GROUP_SIZE，确保与 PPO 在数据量上公平对比
                 global_episode.value += GROUP_SIZE
                 ep = global_episode.value
 
@@ -946,8 +963,8 @@ from models.agent_grpo import Agent_GRPO
 from config import *
 import custom_env
 
-# 必须与主实验一致
-GROUP_SIZE = 4
+# --- [关键同步] 必须与主实验保持一致 ---
+GROUP_SIZE = 16  # 原 8 -> 16
 
 
 def parse_args():
@@ -985,13 +1002,14 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
     last_log_time, update_count = time.time(), 0
     try:
         while global_episode.value < total_episodes:
-            if len(agent.memory) >= BATCH_SIZE * 4:
+            # 确保 Buffer 同样充足
+            if len(agent.memory) >= BATCH_SIZE * 2:
                 with save_lock:
                     agent.learn(global_step.value)
                     update_count += 1
                     if time.time() - last_log_time > 5:
                         print(
-                            f"[Ablation-NoDynamic] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f} (Fixed)")
+                            f"[Ablation-NoDynamic] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.4f} (Fixed)")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
@@ -1022,7 +1040,7 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
     env = gym.make(env_id)
     state_dim = int(np.prod(env.observation_space.shape))
 
-    # [消融实验] 初始化 Agent 时关闭 Dynamic Beta
+    # [消融实验] use_dynamic_beta=False (这是唯一的区别)
     local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
                              GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                              manager=None, is_worker=True, use_dynamic_beta=use_dynamic_beta)
@@ -1079,12 +1097,20 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
             with global_step.get_lock():
                 global_step.value += steps
 
-        # 2. 组内归一化 (GRPO 核心步骤)
+        # 2. 组内归一化 (逻辑必须同步！包含防 Collapse 机制)
         group_returns_arr = np.array(group_returns)
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
 
-        normalized_advantages = (group_returns_arr - group_mean) / group_std
+        # --- [关键同步] 使用同样的崩溃阈值判定 ---
+        CRASH_THRESHOLD = -20.0
+
+        if group_mean < CRASH_THRESHOLD:
+            # 绝对惩罚模式
+            normalized_advantages = (group_returns_arr) / 50.0
+        else:
+            # 正常 GRPO 模式
+            normalized_advantages = (group_returns_arr - group_mean) / group_std
 
         # 3. 存入 Buffer
         for i, traj in enumerate(group_trajectories):
@@ -1128,6 +1154,7 @@ if __name__ == '__main__':
         act_dim = dummy.action_space.n
         dummy.close()
 
+        # use_dynamic_beta=False 是消融实验的核心区别
         agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
                            LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                            manager=manager, is_worker=False, use_dynamic_beta=False)
@@ -1153,11 +1180,10 @@ from models.replay_buffer import Replay_Buffer
 
 class Agent_GRPO:
     """
-    GRPO Agent (修复版)
-    核心变动：
-    1. learn() 函数不再计算 Monte-Carlo Return，也不再进行全局归一化。
-       它假设 Buffer 中取出的 'rewards' 字段已经是 Worker 计算好的 'Group Relative Advantage'。
-    2. calculate_risk() 修复了索引逻辑，配合 Observation Fixed 模式使用。
+    GRPO Agent (优化版 - Risk Aware v2)
+    核心修复：
+    1. calculate_risk: 归一化到 [0, 1]，防止数值爆炸。
+    2. Dynamic Beta: 逻辑反转 -> 危险时放松约束 (Beta变小)，允许大幅修正动作。
     """
 
     def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
@@ -1176,11 +1202,12 @@ class Agent_GRPO:
         self.entropy_coef = entropy_coef
         self.device = device
 
-        # 是否使用动态 Beta (主实验 True, 消融实验 False)
+        # 是否使用动态 Beta
         self.use_dynamic_beta = use_dynamic_beta
 
-        self.beta_init = 0.01
-        self.beta_max = 0.2
+        # Beta 参数设置
+        self.beta_init = 0.01  # 初始 KL 惩罚系数
+        self.beta_min = 0.001  # 最小 Beta (危险时保留微弱约束)
         self.beta = self.beta_init
 
         # Buffer 大小需能容纳多进程并行产生的数据
@@ -1214,8 +1241,11 @@ class Agent_GRPO:
 
     def calculate_risk(self, state):
         """
-        计算风险值 (Risk)
-        依赖: custom_env.py 配置中 observation order="fixed"
+        计算风险值 (Risk) - 线性映射版
+        输出: [0.0, 1.0]
+        Logic:
+            Distance > 30m -> Risk = 0.0 (Safe)
+            Distance < 5m  -> Risk = 1.0 (Danger)
         """
         if state.shape[1] < 10: return 0.0
 
@@ -1223,13 +1253,12 @@ class Agent_GRPO:
         num_feats = 5  # x, y, vx, vy, heading
 
         # Reshape: [Batch, Vehicles, Feats]
+        # 假设 obs 是 fixed order, index 0 是 ego
         reshaped = state.view(batch_size, -1, num_feats)
 
-        # Ego is at Index 0 (Fixed order)
         ego_x = reshaped[:, 0, 0]
         ego_y = reshaped[:, 0, 1]
 
-        # Others start from Index 1
         others_x = reshaped[:, 1:, 0]
         others_y = reshaped[:, 1:, 1]
 
@@ -1239,42 +1268,56 @@ class Agent_GRPO:
         # 还原真实距离 (highway-env 坐标范围 approx 100)
         dists_real = dists_norm * 100.0
 
-        # 过滤 Ghost Vehicles (距离极近的通常是 padding)
+        # 过滤 Ghost Vehicles (距离极近通常是 padding 0,0)
         valid_mask = dists_norm > 0.001
         dists_real_masked = dists_real.clone()
         dists_real_masked[~valid_mask] = float('inf')
 
-        # 限制最小距离
-        min_dist, _ = torch.min(torch.clamp(dists_real_masked, min=5.0), dim=1)
+        # 找到最近的前车距离
+        min_dist, _ = torch.min(dists_real_masked, dim=1)
 
-        # Risk 模型: 距离越近 Risk 越大
-        risk = 20.0 / min_dist
-        risk = torch.nan_to_num(risk, nan=0.0, posinf=0.0)
+        # --- [关键修改] 线性映射风险 ---
+        safe_threshold = 30.0
+        danger_threshold = 5.0
+
+        # 线性插值: (30 - dist) / (30 - 5)
+        # 当 dist=30, risk=0; 当 dist=5, risk=1
+        risk = (safe_threshold - min_dist) / (safe_threshold - danger_threshold)
+
+        # 截断到 [0, 1] 区间
+        risk = torch.clamp(risk, 0.0, 1.0)
+
+        # 处理 NaN (如果没有其他车辆)
+        risk = torch.nan_to_num(risk, nan=0.0)
 
         return risk.mean().item()
 
     def learn(self, current_total_timesteps):
-        # [核心修正]
-        # get_all_and_clear 返回的第三个参数原本是 rewards，现在存储的是 advantages
+        # 获取数据: advantages 字段存储的是 Worker 算好的 Group Advantage
         states, actions, advantages, next_states, dones, logprobs = self.memory.get_all_and_clear()
 
         if states is None or len(states) < self.bs: return
 
         states = states.to(self.device)
         actions = actions.to(self.device)
-        advantages = advantages.to(self.device)  # 这是 Worker 算好的相对优势
+        advantages = advantages.to(self.device)
         logprobs = logprobs.to(self.device)
 
         # Clip Advantage 保证数值稳定
         advantages = torch.clamp(advantages, -4.0, 4.0)
 
-        # 动态 Beta 更新逻辑
+        # --- [关键修改] 反转的动态 Beta 更新逻辑 ---
         if self.use_dynamic_beta:
             current_risk = self.calculate_risk(states)
-            target_beta = self.beta_init * (1 + current_risk)
-            self.beta = min(target_beta, self.beta_max)
+
+            # 新逻辑：Risk 越高 (危险)，Beta 越小 (放松约束)
+            # 目的：允许策略大幅更新以逃离危险状态
+            target_beta = self.beta_init * (1.0 - current_risk)
+
+            # 确保 Beta 不会变成 0 (保留微弱的 Trust Region)
+            self.beta = max(target_beta, self.beta_min)
         else:
-            self.beta = self.beta_init  # 消融实验会一直跑这里
+            self.beta = self.beta_init
 
         # 学习率衰减
         decay = self.dr ** (current_total_timesteps // self.decay_step_size)
@@ -1293,7 +1336,7 @@ class Agent_GRPO:
                 mb_states = states[idx]
                 mb_actions = actions[idx]
                 mb_old_log = logprobs[idx]
-                mb_adv = advantages[idx]  # 直接使用
+                mb_adv = advantages[idx]
 
                 action_probs = self.actor(mb_states)
                 dist = torch.distributions.Categorical(action_probs)
@@ -1308,6 +1351,7 @@ class Agent_GRPO:
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
 
+                # Loss = PPO_Loss + Beta * KL - Entropy
                 loss = -torch.min(surr1, surr2).mean() + \
                        self.beta * approx_kl - \
                        self.entropy_coef * decay * dist_entropy

@@ -11,8 +11,8 @@ from models.agent_grpo import Agent_GRPO
 from config import *
 import custom_env
 
-# 组大小 (Sample G trajectories for same state)
-GROUP_SIZE = 8
+# --- [关键修改] 增大组大小，提升多样性 ---
+GROUP_SIZE = 16  # 原 8 -> 16，增加幸存者概率
 
 
 def parse_args():
@@ -37,7 +37,7 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
 
     processes = []
     for pid in range(num_processes):
-        # [主实验] 默认 use_dynamic_beta=True (在 Agent 初始化中设置)
+        # [主实验] 默认 use_dynamic_beta=True
         p = mp.Process(target=sample_worker, args=(
             env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
             stop_event, max_t, save_lock, rewards_log, speed_log, collision_log))
@@ -50,13 +50,14 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
     last_log_time, update_count = time.time(), 0
     try:
         while global_episode.value < total_episodes:
-            # 等待足够的数据 (Batch Size * Group Size 确保可以进行几次完整的组更新)
-            if len(agent.memory) >= BATCH_SIZE * 4:
+            # 确保 Buffer 里有足够的数据 (Batch Size * 2 比较稳妥)
+            if len(agent.memory) >= BATCH_SIZE * 2:
                 with save_lock:
                     agent.learn(global_step.value)
                     update_count += 1
                     if time.time() - last_log_time > 5:
-                        print(f"[GRPO-Main] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f}")
+                        print(
+                            f"[GRPO-v2] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.4f} | Ent {agent.entropy:.3f}")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
@@ -98,14 +99,14 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
         pass
 
     while not stop_event.is_set():
-        # 1. 组采样初始化 (Same-State Logic)
+        # 1. 组采样初始化
         group_seed = random.randint(0, 1000000)
         group_trajectories = []  # 存储轨迹数据
         group_returns = []  # 存储每条轨迹的 Return
 
         # 2. 采集 Group 轨迹
         for _ in range(GROUP_SIZE):
-            # 强制使用相同的种子重置环境
+            # 强制使用相同的种子重置环境 (Same-State)
             state, _ = env.reset(seed=group_seed)
             state = state.flatten()
             ep_reward, ep_speed, steps = 0, 0, 0
@@ -148,27 +149,35 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
             with global_step.get_lock():
                 global_step.value += steps
 
-        # 3. 组内归一化 (GRPO 核心步骤)
-        # 计算这一组内的 Mean 和 Std
+        # 3. 组内归一化 (GRPO 核心改进版)
         group_returns_arr = np.array(group_returns)
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
 
-        # 计算相对优势 (Advantage)
-        normalized_advantages = (group_returns_arr - group_mean) / group_std
+        # --- [关键修改] 防止 Group Collapse (集体平庸) ---
+        # 如果整组平均分极低 (例如都撞了，平均分可能是 -50 到 -100)，
+        # 那么不应该进行组内归一化(因为那会让 -100 变成 0)，
+        # 而是应该强制给一个负的 Advantage，让模型知道“这组不行”。
+
+        CRASH_THRESHOLD = -20.0  # 设定一个阈值，低于此值视为“全组失败”
+
+        if group_mean < CRASH_THRESHOLD:
+            # 绝对惩罚模式：不用减 Mean，直接除以一个常数，保留负值信号
+            normalized_advantages = (group_returns_arr) / 50.0
+        else:
+            # 正常 GRPO 模式：相对优势
+            normalized_advantages = (group_returns_arr - group_mean) / group_std
 
         # 4. 存入 Buffer (用 Advantage 替换 Reward)
         for i, traj in enumerate(group_trajectories):
             group_adv = normalized_advantages[i]
             for step_data in traj:
                 s, a, r, ns, d, lp, G_t = step_data
-                # [关键] 存入 group_adv 到 Buffer 的第三个位置 (原 reward 位)
                 shared_memory.remember((s, a, group_adv, ns, d, lp))
 
         # 5. 公平计数 & 日志
         with episode_lock:
             if global_episode.value < total_episodes:
-                # [关键修正] 计数器 += GROUP_SIZE，确保与 PPO 在数据量上公平对比
                 global_episode.value += GROUP_SIZE
                 ep = global_episode.value
 

@@ -9,11 +9,10 @@ from models.replay_buffer import Replay_Buffer
 
 class Agent_GRPO:
     """
-    GRPO Agent (修复版)
-    核心变动：
-    1. learn() 函数不再计算 Monte-Carlo Return，也不再进行全局归一化。
-       它假设 Buffer 中取出的 'rewards' 字段已经是 Worker 计算好的 'Group Relative Advantage'。
-    2. calculate_risk() 修复了索引逻辑，配合 Observation Fixed 模式使用。
+    GRPO Agent (优化版 - Risk Aware v2)
+    核心修复：
+    1. calculate_risk: 归一化到 [0, 1]，防止数值爆炸。
+    2. Dynamic Beta: 逻辑反转 -> 危险时放松约束 (Beta变小)，允许大幅修正动作。
     """
 
     def __init__(self, state_size, action_size, bs, lr, dr, decay_step_size, tau, gamma, lam, eps_clip, K_epochs,
@@ -32,11 +31,12 @@ class Agent_GRPO:
         self.entropy_coef = entropy_coef
         self.device = device
 
-        # 是否使用动态 Beta (主实验 True, 消融实验 False)
+        # 是否使用动态 Beta
         self.use_dynamic_beta = use_dynamic_beta
 
-        self.beta_init = 0.01
-        self.beta_max = 0.2
+        # Beta 参数设置
+        self.beta_init = 0.01  # 初始 KL 惩罚系数
+        self.beta_min = 0.001  # 最小 Beta (危险时保留微弱约束)
         self.beta = self.beta_init
 
         # Buffer 大小需能容纳多进程并行产生的数据
@@ -70,8 +70,11 @@ class Agent_GRPO:
 
     def calculate_risk(self, state):
         """
-        计算风险值 (Risk)
-        依赖: custom_env.py 配置中 observation order="fixed"
+        计算风险值 (Risk) - 线性映射版
+        输出: [0.0, 1.0]
+        Logic:
+            Distance > 30m -> Risk = 0.0 (Safe)
+            Distance < 5m  -> Risk = 1.0 (Danger)
         """
         if state.shape[1] < 10: return 0.0
 
@@ -79,13 +82,12 @@ class Agent_GRPO:
         num_feats = 5  # x, y, vx, vy, heading
 
         # Reshape: [Batch, Vehicles, Feats]
+        # 假设 obs 是 fixed order, index 0 是 ego
         reshaped = state.view(batch_size, -1, num_feats)
 
-        # Ego is at Index 0 (Fixed order)
         ego_x = reshaped[:, 0, 0]
         ego_y = reshaped[:, 0, 1]
 
-        # Others start from Index 1
         others_x = reshaped[:, 1:, 0]
         others_y = reshaped[:, 1:, 1]
 
@@ -95,42 +97,56 @@ class Agent_GRPO:
         # 还原真实距离 (highway-env 坐标范围 approx 100)
         dists_real = dists_norm * 100.0
 
-        # 过滤 Ghost Vehicles (距离极近的通常是 padding)
+        # 过滤 Ghost Vehicles (距离极近通常是 padding 0,0)
         valid_mask = dists_norm > 0.001
         dists_real_masked = dists_real.clone()
         dists_real_masked[~valid_mask] = float('inf')
 
-        # 限制最小距离
-        min_dist, _ = torch.min(torch.clamp(dists_real_masked, min=5.0), dim=1)
+        # 找到最近的前车距离
+        min_dist, _ = torch.min(dists_real_masked, dim=1)
 
-        # Risk 模型: 距离越近 Risk 越大
-        risk = 20.0 / min_dist
-        risk = torch.nan_to_num(risk, nan=0.0, posinf=0.0)
+        # --- [关键修改] 线性映射风险 ---
+        safe_threshold = 30.0
+        danger_threshold = 5.0
+
+        # 线性插值: (30 - dist) / (30 - 5)
+        # 当 dist=30, risk=0; 当 dist=5, risk=1
+        risk = (safe_threshold - min_dist) / (safe_threshold - danger_threshold)
+
+        # 截断到 [0, 1] 区间
+        risk = torch.clamp(risk, 0.0, 1.0)
+
+        # 处理 NaN (如果没有其他车辆)
+        risk = torch.nan_to_num(risk, nan=0.0)
 
         return risk.mean().item()
 
     def learn(self, current_total_timesteps):
-        # [核心修正]
-        # get_all_and_clear 返回的第三个参数原本是 rewards，现在存储的是 advantages
+        # 获取数据: advantages 字段存储的是 Worker 算好的 Group Advantage
         states, actions, advantages, next_states, dones, logprobs = self.memory.get_all_and_clear()
 
         if states is None or len(states) < self.bs: return
 
         states = states.to(self.device)
         actions = actions.to(self.device)
-        advantages = advantages.to(self.device)  # 这是 Worker 算好的相对优势
+        advantages = advantages.to(self.device)
         logprobs = logprobs.to(self.device)
 
         # Clip Advantage 保证数值稳定
         advantages = torch.clamp(advantages, -4.0, 4.0)
 
-        # 动态 Beta 更新逻辑
+        # --- [关键修改] 反转的动态 Beta 更新逻辑 ---
         if self.use_dynamic_beta:
             current_risk = self.calculate_risk(states)
-            target_beta = self.beta_init * (1 + current_risk)
-            self.beta = min(target_beta, self.beta_max)
+
+            # 新逻辑：Risk 越高 (危险)，Beta 越小 (放松约束)
+            # 目的：允许策略大幅更新以逃离危险状态
+            target_beta = self.beta_init * (1.0 - current_risk)
+
+            # 确保 Beta 不会变成 0 (保留微弱的 Trust Region)
+            self.beta = max(target_beta, self.beta_min)
         else:
-            self.beta = self.beta_init  # 消融实验会一直跑这里
+            self.beta = self.beta_init
 
         # 学习率衰减
         decay = self.dr ** (current_total_timesteps // self.decay_step_size)
@@ -149,7 +165,7 @@ class Agent_GRPO:
                 mb_states = states[idx]
                 mb_actions = actions[idx]
                 mb_old_log = logprobs[idx]
-                mb_adv = advantages[idx]  # 直接使用
+                mb_adv = advantages[idx]
 
                 action_probs = self.actor(mb_states)
                 dist = torch.distributions.Categorical(action_probs)
@@ -164,6 +180,7 @@ class Agent_GRPO:
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
 
+                # Loss = PPO_Loss + Beta * KL - Entropy
                 loss = -torch.min(surr1, surr2).mean() + \
                        self.beta * approx_kl - \
                        self.entropy_coef * decay * dist_entropy

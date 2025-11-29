@@ -11,8 +11,8 @@ from models.agent_grpo import Agent_GRPO
 from config import *
 import custom_env
 
-# 必须与主实验一致
-GROUP_SIZE = 8
+# --- [关键同步] 必须与主实验保持一致 ---
+GROUP_SIZE = 16  # 原 8 -> 16
 
 
 def parse_args():
@@ -50,13 +50,14 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
     last_log_time, update_count = time.time(), 0
     try:
         while global_episode.value < total_episodes:
-            if len(agent.memory) >= BATCH_SIZE * 4:
+            # 确保 Buffer 同样充足
+            if len(agent.memory) >= BATCH_SIZE * 2:
                 with save_lock:
                     agent.learn(global_step.value)
                     update_count += 1
                     if time.time() - last_log_time > 5:
                         print(
-                            f"[Ablation-NoDynamic] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.3f} (Fixed)")
+                            f"[Ablation-NoDynamic] Upd {update_count} | Step {global_step.value} | Beta {agent.beta:.4f} (Fixed)")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)
@@ -87,7 +88,7 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
     env = gym.make(env_id)
     state_dim = int(np.prod(env.observation_space.shape))
 
-    # [消融实验] 初始化 Agent 时关闭 Dynamic Beta
+    # [消融实验] use_dynamic_beta=False (这是唯一的区别)
     local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU,
                              GAMMA, LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                              manager=None, is_worker=True, use_dynamic_beta=use_dynamic_beta)
@@ -144,12 +145,20 @@ def sample_worker(env_id, shared_memory, global_episode, global_step, total_epis
             with global_step.get_lock():
                 global_step.value += steps
 
-        # 2. 组内归一化 (GRPO 核心步骤)
+        # 2. 组内归一化 (逻辑必须同步！包含防 Collapse 机制)
         group_returns_arr = np.array(group_returns)
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
 
-        normalized_advantages = (group_returns_arr - group_mean) / group_std
+        # --- [关键同步] 使用同样的崩溃阈值判定 ---
+        CRASH_THRESHOLD = -20.0
+
+        if group_mean < CRASH_THRESHOLD:
+            # 绝对惩罚模式
+            normalized_advantages = (group_returns_arr) / 50.0
+        else:
+            # 正常 GRPO 模式
+            normalized_advantages = (group_returns_arr - group_mean) / group_std
 
         # 3. 存入 Buffer
         for i, traj in enumerate(group_trajectories):
@@ -193,6 +202,7 @@ if __name__ == '__main__':
         act_dim = dummy.action_space.n
         dummy.close()
 
+        # use_dynamic_beta=False 是消融实验的核心区别
         agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA,
                            LAMDA, EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, ENTROPY_COEF, DEVICE, shared=False,
                            manager=manager, is_worker=False, use_dynamic_beta=False)

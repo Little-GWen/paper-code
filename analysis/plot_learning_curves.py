@@ -11,9 +11,9 @@ SAVE_DIR = '../analysis'
 experiments_config = {
     # [关键] PPO 每次更新1个ep，GRPO 每次更新8个ep。
     # 为了在图上公平对比，GRPO 的 step_scale 必须是 8。
-    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 8, 'color': '#1f77b4'},
+    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 16, 'color': '#1f77b4'},
     'PPO (Baseline)': {'folder': 'ppo', 'step_scale': 1, 'color': '#ff7f0e'},
-    'GRPO (Ablation)': {'folder': 'grpo_no_dynamic', 'step_scale': 8, 'color': '#2ca02c'},
+    'GRPO (Ablation)': {'folder': 'grpo_no_dynamic', 'step_scale': 16, 'color': '#2ca02c'},
 }
 
 

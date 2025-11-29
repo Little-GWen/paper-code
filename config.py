@@ -17,7 +17,7 @@ BATCH_SIZE = 1024         # 原 512，建议 1024 或 2048
 LEARNING_RATE = 0.0005    # 原 0.0003，配合新的 Reward Scale 稍微调大
 
 # 衰减参数
-DECAY_RATE = 0.999
+DECAY_RATE = 0.995
 DECAY_STEP_SIZE = 10000
 
 # 算法通用参数
@@ -32,7 +32,7 @@ CRITIC_LOSS_COEF = 0.5
 ENTROPY_COEF = 0.01      # 原 0.05，降低熵正则化，避免过于随机
 
 # 训练时长
-RAM_NUM_EPISODE = 10000  # 稍微增加总轮次
+RAM_NUM_EPISODE = 40000  # 稍微增加总轮次
 MAX_T = 1000
 
 # 可视化参数
