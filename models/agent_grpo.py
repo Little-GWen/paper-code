@@ -37,6 +37,7 @@ class Agent_GRPO:
 
         self.beta_init = 0.01
         self.beta_min = 0.0001
+        self.beta_max = 0.05
         self.beta = self.beta_init
 
         # Buffer 大小需能容纳多进程并行产生的数据
@@ -189,10 +190,10 @@ class Agent_GRPO:
         # 如果这条轨迹撞车了，无论它相对于平均值如何，强制它的优势为负
         for i in range(len(normalized_advantages)):
             if group_crashed[i]:
-                # 如果归一化后是正的（误判），强行打压为负数
-                # -1.0 代表比平均水平差一个标准差，是一个合理的惩罚基准
-                if normalized_advantages[i] > -0.5:
-                    normalized_advantages[i] = -1.0
+                # 使用 np.minimum 做截断，而不是强制赋值
+                # 这样：-1.5 还是 -1.5 (保留更差的信号)
+                #      +2.0 变成 -0.5 (防止被奖励，但比 -1.5 好)
+                normalized_advantages[i] = np.minimum(normalized_advantages[i], -0.5)
 
         return normalized_advantages, group_mean
 
@@ -209,21 +210,28 @@ class Agent_GRPO:
         advantages = advantages.to(self.device)  # 这是 Worker 算好的相对优势
         logprobs = logprobs.to(self.device)
 
+        # 放大优势
         # Clip Advantage 保证数值稳定
+        advantages = advantages * 5.0
         advantages = torch.clamp(advantages, -4.0, 4.0)
 
         # 动态 Beta 更新逻辑
         if self.use_dynamic_beta:
             current_risk = self.calculate_risk(states)
-            print(f" | current_risk: {current_risk} | ")
+            #print(f" | current_risk: {current_risk} | ")
 
             # 使用反比例公式，保证 Beta 永远 > 0
             # 敏感度因子 risk_sensitivity 建议值:
+            #   1.0  -> 危险时(Risk=1), Beta 降为原来的 1/2 (保守，防止做出过激行为)
             #   5.0  -> 危险时(Risk=1), Beta 降为原来的 1/6 (适中)
             #   10.0 -> 危险时(Risk=1), Beta 降为原来的 1/11 (激进，允许剧烈改变)
-            risk_sensitivity = 10.0
+            risk_sensitivity = 1.0
+            #target_beta = self.beta_init / (1.0 + risk_sensitivity * current_risk)
+            #self.beta = max(target_beta, self.beta_min)
+
+            # 使用乘法公式（更加稳健，用于解决超速震荡）
             target_beta = self.beta_init / (1.0 + risk_sensitivity * current_risk)
-            self.beta = max(target_beta, self.beta_min)
+            self.beta = min(target_beta, self.beta_max)
         else:
             self.beta = self.beta_init  # 消融实验会一直跑这里
 
@@ -269,7 +277,7 @@ class Agent_GRPO:
                 self.optimizer.step()
 
         self.entropy = dist_entropy.item()          # 策略熵
-        print(f" | approx_kl: {approx_kl} | ")      # 最后一次的 approx_kl
+        #print(f" | approx_kl: {approx_kl} | ")      # 最后一次的 approx_kl
 
     def get_state_dict(self):
         return {'actor': self.actor.state_dict()}
