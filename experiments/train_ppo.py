@@ -5,8 +5,9 @@ from multiprocessing import Value
 import time
 import gymnasium as gym
 import torch.multiprocessing as mp
+import custom_env
 from models.agent_ppo import Agent_PPO
-from config import *
+from config.config import *
 
 
 def parse_args():
@@ -138,4 +139,4 @@ if __name__ == '__main__':
         agent = Agent_PPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_RATE, DECAY_STEP_SIZE, TAU, GAMMA, LAMDA,
                           EPS_CLIP, K_EPOCHS, CRITIC_LOSS_COEF, PPO_ENTROPY_COEF, DEVICE, shared=False, manager=manager,
                           is_worker=False)
-        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE / 4, MAX_T, agent, manager, save_dir)

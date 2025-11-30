@@ -5,8 +5,9 @@ from multiprocessing import Value
 import time
 import gymnasium as gym
 import torch.multiprocessing as mp
+import custom_env
 from models.agent_ppo_safe import Agent_PPO_Safe
-from config import *
+from config.config import *
 
 
 def parse_args():

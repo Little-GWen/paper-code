@@ -6,7 +6,8 @@ from multiprocessing import Value
 import gymnasium as gym
 import torch.multiprocessing as mp
 from models.agent_grpo import Agent_GRPO
-from config import *
+import custom_env
+from config.grpo_config import *
 
 
 def parse_args():
@@ -50,7 +51,7 @@ def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager,
                     agent.learn(global_step.value)
                     update_count += 1
                     if time.time() - last_log_time > 5:
-                        print(f"[GRPO-Main] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f} | Beta {agent.beta:.6f}")
+                        print(f"\n[GRPO-Main] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f} | Beta {agent.beta:.6f}")
                         last_log_time = time.time()
                     if update_count % 5 == 0:
                         torch.save(agent.actor.state_dict(), weights_path)

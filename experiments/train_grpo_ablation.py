@@ -5,8 +5,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from multiprocessing import Value
 import gymnasium as gym
 import torch.multiprocessing as mp
+import custom_env
 from models.agent_grpo import Agent_GRPO
-from config import *
+from config.config import *
 
 # 必须与主实验一致
 GROUP_SIZE = 8

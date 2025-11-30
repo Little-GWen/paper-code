@@ -3,8 +3,9 @@ import sys, os, argparse
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from multiprocessing import Manager
 import gymnasium as gym
+import custom_env
 from models.agent_dqn import Agent_DQN
-from config import *
+from config.config import *
 
 
 def parse_args():
