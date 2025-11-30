@@ -12,7 +12,7 @@ ALGORITHMS = [
     ("experiments/train_grpo.py", "GRPO (Ours)"),
 
     # 2. PPO 基线 (Baseline)
-    ("experiments/train_ppo.py", "PPO (Baseline)"),
+    #("experiments/train_ppo.py", "PPO (Baseline)"),
 
     # 3. PPO_Safe 基线 (Baseline)
     #("experiments/train_ppo_safe.py", "PPO_Safe (Baseline)"),
