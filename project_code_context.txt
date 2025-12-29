@@ -18,7 +18,7 @@ from config.grpo_config import *
 from envs.custom_highway_env import HighwayEnv
 from envs.custom_merge_env import MergeEnv
 
-from models.agent_grpo import Agent_GRPO
+from models.agent_grpo_ray import Agent_GRPO_Ray
 from stable_baselines3 import PPO, DQN
 
 folder_map = {
@@ -98,7 +98,7 @@ def test(env, agent, episodes, max_t, render, save_dir):
             # --- 核心适配逻辑 ---
             # 如果是 GRPO，手动在这里 flatten 一下传进去
             # 如果是 PPO/DQN (SB3_Wrapper)，直接传 (10, 6)
-            if isinstance(agent, Agent_GRPO):
+            if isinstance(agent, Agent_GRPO_Ray):
                 state = state.flatten()
 
             # 开启确定性模式
@@ -177,7 +177,7 @@ def main():
 
     # 加载模型
     if args.algo in ['grpo', 'grpo_standard']:
-        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA,
+        agent = Agent_GRPO_Ray(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA,
                            EPS_CLIP, K_EPOCHS, ENTROPY_COEF, DEVICE)
         if os.path.exists(model_path):
             print(f"📂 Loading GRPO weights from: {model_path}")
@@ -270,27 +270,32 @@ if __name__ == "__main__":
 ====================
 FILE: ./run_all_seeds.py
 ====================
+
 import os
+# === 🚀 性能优化: 限制线程数 (必须在最前面) ===
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
 import subprocess
 import time
 
 # --- 实验配置 ---
 # 为了发论文，建议跑 3 个种子以画出阴影图。
 # 如果只是想快速测试代码是否报错，可以临时改为 [0]
-SEEDS = [0]
+SEEDS = [0,1,2]
 
 ALGORITHMS = [
     # 1. GRPO 主模型 (Ours)
     ("experiments/train_grpo.py", "GRPO (Ours)"),
 
     # 2. PPO 基线 (Baseline)
-    #("experiments/train_ppo.py", "PPO (Baseline)"),
+    ("experiments/train_ppo.py", "PPO (Baseline)"),
 
     # 3. DQN 基线 (Baseline)
-    #("experiments/train_dqn.py", "DQN (Baseline)"),
+    ("experiments/train_dqn.py", "DQN (Baseline)"),
 
     # 4. GRPO 消融实验 (Standard)
-    ("experiments/train_grpo_standard.py", "GRPO (Standard)")
+    #("experiments/train_grpo_standard.py", "GRPO (Standard)")
 ]
 
 
@@ -704,7 +709,7 @@ RAM_NUM_EPISODE = 50000
 MAX_T = 60
 
 # 训练参数
-NUM_PROCESSES = 20
+NUM_PROCESSES = 30
 
 
 # --- 废弃参数 ---
@@ -744,11 +749,11 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 RAM_ENV_NAME = 'my-merge-v0'
 
 # 训练时长
-RAM_NUM_EPISODE = 200000
+RAM_NUM_EPISODE = 80000
 MAX_T = 60
 
 # 训练参数
-NUM_PROCESSES = 20
+NUM_PROCESSES =30
 BATCH_SIZE = 8192       # 采集 8192 步训练一次
 MINI_BATCH_SIZE = 512   # 与 8192 采集量配合
 LEARNING_RATE = 3e-4
@@ -776,151 +781,191 @@ def set_seed(seed):
 ====================
 FILE: ./experiments/train_dqn.py
 ====================
-import sys, os, argparse, numpy, torch
+import sys
+import os
+import argparse
 
+import gymnasium
+import numpy as np
+import torch
+import gymnasium as gym
+import ray
+
+# 添加项目根目录
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import *
 
-from envs.custom_highway_env import HighwayEnv
+from stable_baselines3 import DQN
+from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+
+from config.config import *
 from envs.custom_merge_env import MergeEnv
 
-# SB3 核心库
-from stable_baselines3 import DQN
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+# 主进程注册环境
+gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    return parser.parse_args()
+# ================= 自定义 Ray Worker (同 PPO) =================
+@ray.remote
+class RayWorker:
+    def __init__(self, env_id, seed):
+        import gymnasium as gym
+        from envs.custom_merge_env import MergeEnv
+        try:
+            gym.make(env_id)
+        except gymnasium.error.NameNotFound:
+            gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
 
-# --- 自定义回调函数：用于记录碰撞率和平均速度 ---
+        self.env = gym.make(env_id)
+        self.env.reset(seed=seed)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if terminated or truncated:
+            obs, _ = self.env.reset()
+
+        # 🛡️ NaN 清洗
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return obs, reward, terminated or truncated, info
+
+    def reset(self):
+        obs, _ = self.env.reset()
+        # 🛡️ NaN 清洗
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        return obs
+
+    def close(self):
+        self.env.close()
+
+
+# ================= 自定义 Ray VecEnv (同 PPO) =================
+class RayVecEnv(VecEnv):
+    def __init__(self, env_id, num_envs, seed_start=0):
+        ray.init(ignore_reinit_error=True)
+        self.workers = [RayWorker.remote(env_id, seed_start + i) for i in range(num_envs)]
+
+        dummy = gym.make(env_id)
+
+        self.num_envs = num_envs
+        self.observation_space = dummy.observation_space
+        self.action_space = dummy.action_space
+        self.render_mode = getattr(dummy, "render_mode", None)
+        self.metadata = getattr(dummy, "metadata", {"render_modes": []})
+
+        dummy.close()
+
+    def step_async(self, actions):
+        self.futures = [w.step.remote(a) for w, a in zip(self.workers, actions)]
+
+    def step_wait(self):
+        results = ray.get(self.futures)
+        obs, rews, dones, infos = zip(*results)
+        return np.stack(obs), np.stack(rews), np.stack(dones), list(infos)
+
+    def reset(self):
+        return np.stack(ray.get([w.reset.remote() for w in self.workers]))
+
+    def close(self):
+        ray.get([w.close.remote() for w in self.workers])
+        ray.shutdown()
+
+    def get_attr(self, attr_name, indices=None): return []
+
+    def set_attr(self, attr_name, value, indices=None): pass
+
+    def env_method(self, method_name, *args, **kwargs): return []
+
+    def env_is_wrapped(self, wrapper, indices=None): return [False] * self.num_envs
+
+    def seed(self, seed=None): return
+
+
+# ================= 回调函数 =================
 class MatchCallback(BaseCallback):
-    def __init__(self, save_dir, verbose=0):
-        super().__init__(verbose)
+    def __init__(self, save_dir):
+        super().__init__(verbose=0)
         self.save_dir = save_dir
-        self.weights_path = os.path.join(save_dir, 'weights.pth')
+        self.log_rew = []
+        self.log_spd = []
+        self.log_col = []
 
-        # 全局日志
-        self.global_rewards_log = []
-        self.global_speed_log = []
-        self.global_collision_log = []
-
-        self.episode_count = 0
-        self.n_envs = None
-
-        # 临时存储每个环境当前回合的累积值
-        self.current_ep_rewards = None
-        self.current_ep_speeds = None
-        self.current_ep_steps = None
-
-    def _init_callback(self) -> None:
-        # 初始化环境数量和临时数组
-        self.n_envs = self.training_env.num_envs
-        self.current_ep_rewards = np.zeros(self.n_envs)
-        self.current_ep_speeds = np.zeros(self.n_envs)
-        self.current_ep_steps = np.zeros(self.n_envs)
+        self.ep_rew = np.zeros(NUM_PROCESSES)
+        self.ep_spd = np.zeros(NUM_PROCESSES)
+        self.ep_len = np.zeros(NUM_PROCESSES)
 
     def _on_step(self) -> bool:
-        # 获取来自所有并行环境的数据
-        obs = self.locals['new_obs']        # Shape: [n_envs, features]
-        rewards = self.locals['rewards']    # Shape: [n_envs]
-        dones = self.locals['dones']        # Shape: [n_envs]
-        infos = self.locals['infos']        # List[Dict] length: n_envs
+        rewards = self.locals['rewards']
+        dones = self.locals['dones']
+        infos = self.locals['infos']
 
-        for i in range(self.n_envs):
-            # 1. 累加奖励
-            self.current_ep_rewards[i] += rewards[i]
+        self.ep_rew += rewards
+        self.ep_len += 1
 
-            # 2. 累加速度 (模拟原来的 state[2])
-            # obs shape: [n_envs, n_vehicles, n_features]
-            norm_speed = obs[i, 0, 2]
-            if isinstance(norm_speed, torch.Tensor):
-                speed_val = norm_speed.item()
-            else:
-                speed_val = float(norm_speed)
+        for i in range(len(infos)):
+            self.ep_spd[i] += infos[i].get('speed', 0)
 
-            self.current_ep_speeds[i] += speed_val
-            self.current_ep_steps[i] += 1
-
-            # 3. 结束逻辑
             if dones[i]:
-                self.episode_count += 1
+                self.log_rew.append(self.ep_rew[i])
+                self.log_spd.append(self.ep_spd[i] / max(1, self.ep_len[i]))
+                self.log_col.append(1.0 if infos[i].get('crashed', False) else 0.0)
 
-                avg_speed = self.current_ep_speeds[i] / max(1, self.current_ep_steps[i])
-                is_crashed = 1.0 if infos[i].get("crashed", False) else 0.0
+                self.ep_rew[i] = 0
+                self.ep_spd[i] = 0
+                self.ep_len[i] = 0
 
-                # 存入全局列表
-                self.global_rewards_log.append(self.current_ep_rewards[i])
-                self.global_speed_log.append(avg_speed)
-                self.global_collision_log.append(is_crashed)
+        # DQN 可以在 step 中定期保存
+        if self.num_timesteps % 5000 == 0:
+            self._save_logs()
+        return True
 
-                # 打印日志 (只打第0个环境)
-                if self.verbose > 0 and i == 0:
-                    print(f"\rEp: {self.episode_count} | Rew: {self.current_ep_rewards[i]:.1f}", end="", flush=True)
+    def _save_logs(self):
+        if len(self.log_rew) > 0:
+            print(f"   [DQN] Steps: {self.num_timesteps} | Mean Rew: {np.mean(self.log_rew[-100:]):.2f}")
+            np.save(os.path.join(self.save_dir, 'rewards.npy'), self.log_rew)
+            np.save(os.path.join(self.save_dir, 'speed.npy'), self.log_spd)
+            np.save(os.path.join(self.save_dir, 'collision.npy'), self.log_col)
+            torch.save(self.model.policy.state_dict(), os.path.join(self.save_dir, 'weights.pth'))
 
-                # 重置当前环境的计数器
-                self.current_ep_rewards[i] = 0
-                self.current_ep_speeds[i] = 0
-                self.current_ep_steps[i] = 0
-
-        # 每 2048 步保存一次日志和模型
-        if self.num_timesteps % 2048 == 0:
-            if self.verbose > 0:
-                print()  # 打印一个空行
-
-            torch.save(self.model.policy.state_dict(), self.weights_path)
-            np.save(os.path.join(self.save_dir, 'rewards.npy'), self.global_rewards_log)
-            np.save(os.path.join(self.save_dir, 'speed.npy'), self.global_speed_log)
-            np.save(os.path.join(self.save_dir, 'collision.npy'), self.global_collision_log)
-
-            if self.verbose > 0:
-                print(f" [Saved Logs & Model at Update {self.num_timesteps}]")
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--n_workers', type=int, default=NUM_PROCESSES)
+    args = parser.parse_args()
 
-    # 1. 路径对齐
     save_dir = f'results/train/dqn/seed_{args.seed}'
     if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 2. 创建并行环境
-    env = make_vec_env(env_id=RAM_ENV_NAME, n_envs=NUM_PROCESSES, seed=args.seed, vec_env_cls=SubprocVecEnv)
+    # 初始化并行环境
+    env = RayVecEnv(RAM_ENV_NAME, args.n_workers, seed_start=args.seed)
 
-    # 3. 网络结构
     policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=[512, 512])
 
-    # 4. 初始化 DQN
+    # 初始化 DQN
+    # DQN 比较吃内存，buffer_size 设为 50000 比较安全
     model = DQN(
         "MlpPolicy",
         env,
         verbose=1,
         device=DEVICE,
-        policy_kwargs=policy_kwargs,  # 注入自定义网络结构
-        # tensorboard_log=save_dir    # tensorboard 绘图
+        policy_kwargs=policy_kwargs,
+        buffer_size=50000,
+        learning_starts=5000,
+        batch_size=256
     )
 
-    # 5. 初始化回调 (用于保存 weights.pth 和 .npy)
-    callback = MatchCallback(save_dir=save_dir, verbose=1)
-
-    # 6. 开始训练
-    print(f"🚀 Start training DQN with Seed {args.seed}...")
-    print(f"📂 Saving to: {save_dir}")
+    print(f"🚀 DQN (Ray) Training Started | Workers: {args.n_workers}")
     try:
-        model.learn(
-            total_timesteps=RAM_NUM_EPISODE * MAX_T,
-            callback=callback,
-            progress_bar=True
-        )
+        model.learn(total_timesteps=RAM_NUM_EPISODE * MAX_T, callback=MatchCallback(save_dir))
     except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user.")
+        print("Interrupted.")
     finally:
-        # 确保退出时保存
-        torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
         env.close()
-        print("Done.")
+        torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
+
 
 if __name__ == '__main__':
     main()
@@ -928,157 +973,218 @@ if __name__ == '__main__':
 ====================
 FILE: ./experiments/train_ppo.py
 ====================
-import sys, os, argparse, numpy, torch
+import sys
+import os
+import argparse
+import numpy as np
+import torch
+import gymnasium as gym
+import ray
 
+# 添加项目根目录，确保能导入 config 和 envs
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import *
 
-from envs.custom_highway_env import HighwayEnv
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.callbacks import BaseCallback
+
+from config.config import *
 from envs.custom_merge_env import MergeEnv
 
-# SB3 核心库
-from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+# 主进程注册环境
+gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    return parser.parse_args()
+# ================= 自定义 Ray Worker (带环境注册 & NaN防护) =================
+@ray.remote
+class RayWorker:
+    def __init__(self, env_id, seed):
+        # 1. 重新注册环境 (防止 Ray Worker 找不到)
+        import gymnasium as gym
+        from envs.custom_merge_env import MergeEnv
+        try:
+            gym.make(env_id)
+        except gymnasium.error.NameNotFound:
+            gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
 
-# --- 自定义回调函数：用于记录碰撞率和平均速度 ---
+        self.env = gym.make(env_id)
+        self.env.reset(seed=seed)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if terminated or truncated:
+            obs, _ = self.env.reset()
+
+        # 2. 🛡️ 鲁棒性保护：NaN 清洗
+        # 如果环境返回 NaN，强制变为 0，防止 PPO 崩溃
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return obs, reward, terminated or truncated, info
+
+    def reset(self):
+        obs, _ = self.env.reset()
+
+        # 2. 🛡️ 鲁棒性保护：NaN 清洗
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return obs
+
+    def close(self):
+        self.env.close()
+
+
+# ================= 自定义 Ray VecEnv (修复 SB3 兼容性) =================
+class RayVecEnv(VecEnv):
+    def __init__(self, env_id, num_envs, seed_start=0):
+        ray.init(ignore_reinit_error=True)
+        self.workers = [RayWorker.remote(env_id, seed_start + i) for i in range(num_envs)]
+
+        # 获取环境信息用于初始化
+        dummy = gym.make(env_id)
+
+        # 3. 手动赋值属性 (跳过 super().__init__ 以避免 render_mode 报错)
+        self.num_envs = num_envs
+        self.observation_space = dummy.observation_space
+        self.action_space = dummy.action_space
+        self.render_mode = getattr(dummy, "render_mode", None)
+        self.metadata = getattr(dummy, "metadata", {"render_modes": []})
+
+        dummy.close()
+
+    def step_async(self, actions):
+        self.futures = [w.step.remote(a) for w, a in zip(self.workers, actions)]
+
+    def step_wait(self):
+        results = ray.get(self.futures)
+        obs, rews, dones, infos = zip(*results)
+        return np.stack(obs), np.stack(rews), np.stack(dones), list(infos)
+
+    def reset(self):
+        return np.stack(ray.get([w.reset.remote() for w in self.workers]))
+
+    def close(self):
+        ray.get([w.close.remote() for w in self.workers])
+        ray.shutdown()
+
+    # SB3 必需的抽象方法实现
+    def get_attr(self, attr_name, indices=None): return []
+
+    def set_attr(self, attr_name, value, indices=None): pass
+
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs): return []
+
+    def env_is_wrapped(self, wrapper_class, indices=None): return [False] * self.num_envs
+
+    def seed(self, seed=None): return
+
+
+# ================= 回调函数 (增加 Episodes 显示) =================
 class MatchCallback(BaseCallback):
-    def __init__(self, save_dir, verbose=0):
-        super().__init__(verbose)
+    def __init__(self, save_dir):
+        super().__init__(verbose=0)
         self.save_dir = save_dir
-        self.weights_path = os.path.join(save_dir, 'weights.pth')
+        self.log_rew = []
+        self.log_spd = []
+        self.log_col = []
 
-        # 全局日志
-        self.global_rewards_log = []
-        self.global_speed_log = []
-        self.global_collision_log = []
+        # 临时 buffer
+        self.ep_rew = np.zeros(NUM_PROCESSES)
+        self.ep_spd = np.zeros(NUM_PROCESSES)
+        self.ep_len = np.zeros(NUM_PROCESSES)
 
-        self.episode_count = 0
-        self.update_count = 0
-        self.n_envs = None
-
-        # 临时存储每个环境当前回合的累积值
-        self.current_ep_rewards = None
-        self.current_ep_speeds = None
-        self.current_ep_steps = None
-
-    def _init_callback(self) -> None:
-        # 初始化环境数量和临时数组
-        self.n_envs = self.training_env.num_envs
-        self.current_ep_rewards = np.zeros(self.n_envs)
-        self.current_ep_speeds = np.zeros(self.n_envs)
-        self.current_ep_steps = np.zeros(self.n_envs)
+        # 🆕 总回合计数器
+        self.total_episodes = 0
 
     def _on_step(self) -> bool:
-        # 获取来自所有并行环境的数据
-        obs = self.locals['new_obs']        # Shape: [n_envs, features]
-        rewards = self.locals['rewards']    # Shape: [n_envs]
-        dones = self.locals['dones']        # Shape: [n_envs]
-        infos = self.locals['infos']        # List[Dict] length: n_envs
+        rewards = self.locals['rewards']
+        dones = self.locals['dones']
+        infos = self.locals['infos']
 
-        for i in range(self.n_envs):
-            # 1. 累加奖励
-            self.current_ep_rewards[i] += rewards[i]
+        self.ep_rew += rewards
+        self.ep_len += 1
 
-            # 2. 累加速度 (模拟原来的 state[2])
-            # obs shape: [n_envs, n_vehicles, n_features]
-            norm_speed = obs[i, 0, 2]
-            if isinstance(norm_speed, torch.Tensor):
-                speed_val = norm_speed.item()
-            else:
-                speed_val = float(norm_speed)
+        for i in range(len(infos)):
+            self.ep_spd[i] += infos[i].get('speed', 0)
 
-            self.current_ep_speeds[i] += speed_val
-            self.current_ep_steps[i] += 1
-
-            # 3. 结算逻辑
             if dones[i]:
-                self.episode_count += 1
+                # 🆕 计数 +1
+                self.total_episodes += 1
 
-                avg_speed = self.current_ep_speeds[i] / max(1, self.current_ep_steps[i])
-                is_crashed = 1.0 if infos[i].get("crashed", False) else 0.0
+                self.log_rew.append(self.ep_rew[i])
+                self.log_spd.append(self.ep_spd[i] / max(1, self.ep_len[i]))
+                self.log_col.append(1.0 if infos[i].get('crashed', False) else 0.0)
 
-                # 存入全局列表
-                self.global_rewards_log.append(self.current_ep_rewards[i])
-                self.global_speed_log.append(avg_speed)
-                self.global_collision_log.append(is_crashed)
-
-                # 打印日志 (只打第0个环境)
-                if self.verbose > 0 and i == 0:
-                    print(f"\rEp: {self.episode_count} | Rew: {self.current_ep_rewards[i]:.1f}", end="", flush=True)
-
-                # 重置当前环境的计数器
-                self.current_ep_rewards[i] = 0
-                self.current_ep_speeds[i] = 0
-                self.current_ep_steps[i] = 0
-
+                # 重置
+                self.ep_rew[i] = 0
+                self.ep_spd[i] = 0
+                self.ep_len[i] = 0
         return True
 
-    def _on_rollout_end(self) -> None:
-        self.update_count += 1
+    def _on_rollout_end(self):
+        # 定期打印与保存
+        if len(self.log_rew) > 0:
+            avg_rew = np.mean(self.log_rew[-100:])
+            col_rate = np.mean(self.log_col[-100:])
 
-        if self.verbose > 0:
-            print()  # 打印一个空行
+            # 🆕 打印 Episode 信息
+            print(
+                f"   [PPO] Episodes: {self.total_episodes} | Steps: {self.num_timesteps} | Mean Rew: {avg_rew:.2f} | Col: {col_rate:.2f}")
 
-        # 每更新 5 次保存一次
-        if self.update_count % 5 == 0:
-            torch.save(self.model.policy.state_dict(), self.weights_path)
-            np.save(os.path.join(self.save_dir, 'rewards.npy'), self.global_rewards_log)
-            np.save(os.path.join(self.save_dir, 'speed.npy'), self.global_speed_log)
-            np.save(os.path.join(self.save_dir, 'collision.npy'), self.global_collision_log)
+            # 保存
+            np.save(os.path.join(self.save_dir, 'rewards.npy'), self.log_rew)
+            np.save(os.path.join(self.save_dir, 'speed.npy'), self.log_spd)
+            np.save(os.path.join(self.save_dir, 'collision.npy'), self.log_col)
+            torch.save(self.model.policy.state_dict(), os.path.join(self.save_dir, 'weights.pth'))
 
-            if self.verbose > 0:
-                print(f" [Saved Logs & Model at Update {self.update_count}]")
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--n_workers', type=int, default=NUM_PROCESSES)
+    args = parser.parse_args()
 
-    # 1. 路径对齐
     save_dir = f'results/train/ppo/seed_{args.seed}'
     if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 2. 创建并行环境
-    env = make_vec_env(env_id=RAM_ENV_NAME, n_envs=NUM_PROCESSES, seed=args.seed, vec_env_cls=SubprocVecEnv)
+    # 初始化并行环境
+    env = RayVecEnv(RAM_ENV_NAME, args.n_workers, seed_start=args.seed)
 
-    # 3. 网络结构
+    # 策略网络设置
     policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=dict(pi=[512, 512], vf=[512, 512]))
 
-    # 4. 初始化 PPO
+    # === 关键参数调整 ===
+    # 目的：消除 UserWarning，并适配 Ray 的并行采样
+    # 假设 n_workers = 7 (你的配置)
+    # n_steps = 512 -> 总 Buffer = 512 * 7 = 3584 步
+    # batch_size = 1024 -> 3584 足够分成 3 个完整的 batch (剩一点丢弃)
+    # 这样既不会报错，也能保证训练稳定
+
     model = PPO(
         "MlpPolicy",
         env,
         verbose=1,
         device=DEVICE,
-        policy_kwargs=policy_kwargs,  # 注入自定义网络结构
-        # tensorboard_log=save_dir    # tensorboard 绘图
+        policy_kwargs=policy_kwargs,
+
+        n_steps=512,  # 每个 Worker 采集步数 (调大一点，避免 Buffer 太小)
+        batch_size=1024,  # 每次更新使用的 Batch (1024 适合中等规模训练)
+        n_epochs=10,  # 每次更新循环 10 遍
+        learning_rate=3e-4,
+        ent_coef=0.01  # 增加熵正则，鼓励探索
     )
 
-    # 5. 初始化回调 (用于保存 weights.pth 和 .npy)
-    callback = MatchCallback(save_dir=save_dir, verbose=1)
-
-    # 6. 开始训练
-    print(f"🚀 Start training PPO with Seed {args.seed}...")
-    print(f"📂 Saving to: {save_dir}")
+    print(f"🚀 PPO (Ray) Training Started | Workers: {args.n_workers}")
     try:
-        model.learn(
-            total_timesteps=RAM_NUM_EPISODE * MAX_T,
-            callback=callback,
-            progress_bar=True
-        )
+        model.learn(total_timesteps=RAM_NUM_EPISODE * MAX_T, callback=MatchCallback(save_dir))
     except KeyboardInterrupt:
-        print("\n🛑 Training interrupted by user.")
+        print("Interrupted.")
     finally:
-        # 确保退出时保存
-        torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
         env.close()
-        print("Done.")
+        # 确保最后保存一次
+        torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
+
 
 if __name__ == '__main__':
     main()
@@ -1086,728 +1192,269 @@ if __name__ == '__main__':
 ====================
 FILE: ./experiments/train_grpo.py
 ====================
-import sys, os, argparse
-import time
+import sys, os, time, argparse, numpy as np, torch, gymnasium as gym, ray
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from multiprocessing import Value
-import gymnasium as gym
-import torch.multiprocessing as mp
+import gymnasium
 
-from models.agent_grpo import Agent_GRPO
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.grpo_config import *
-
-from envs.custom_highway_env import HighwayEnv
+from models.agent_grpo_ray import Agent_GRPO_Ray
 from envs.custom_merge_env import MergeEnv
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    return parser.parse_args()
+# 注册环境
+gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
-    weights_path = os.path.join(save_dir, 'weights.pth')
-
-    # shared_context
-    shared_ctx = {
-        'episode': Value('i', 0),   # global_episode
-        'step': Value('i', 0),      # global_step
-        'baseline': manager.Value('d', 0.0),            # global_baseline
-
-        # 移除 param_queue，改用 manager.dict()
-        # 原因：Queue 需要不断 put/get 还要清空，dict 直接 update 覆盖即可，天然线程安全
-        'weights': manager.dict(),
-
-        'logs': {
-            'rewards': manager.list(),
-            'speed': manager.list(),
-            'collision': manager.list()
-        },
-        'locks': {
-            'episode': manager.Lock(),
-            'save': manager.Lock(),
-            'baseline': manager.Lock()
-        },
-        'events': {
-            'stop': manager.Event(),
-            'can_sample': manager.Event()  # 对应原来的 update_event
-        }
-    }
-
-    # 初始设置
-    shared_ctx['events']['can_sample'].set()    # 绿灯
-    shared_ctx['weights'].update(agent.get_state_dict())    # 初始权重
-
-    processes = []
-    for pid in range(num_processes):
-        p = mp.Process(target=sample_worker, args=(env_id, agent.memory, shared_ctx, max_t, total_episodes, pid))
-        p.start()
-        processes.append(p)
-
-    last_log_time, update_count = time.time(), 0
-
-    try:
-        while shared_ctx['episode'].value < total_episodes:
-            if len(agent.memory) >= BATCH_SIZE:
-                # === 进入训练阶段 (红灯) ===
-                shared_ctx['events']['can_sample'].clear()  # 命令所有 Worker 停手
-                time.sleep(0.1) # 确保所有 Worker 跑完当前手头的这一轮 Group
-
-                with shared_ctx['locks']['save']:
-                    # 训练
-                    agent.learn(shared_ctx['step'].value)
-                    agent.memory.clear()
-                    update_count += 1
-
-                    # 日志打印
-                    if time.time() - last_log_time > 5:
-                        print(f"\n[GRPO-Main] Upd {update_count} | Step {shared_ctx['step'].value} | Ent {agent.entropy:.3f} | Base {shared_ctx['baseline'].value:.2f}")
-                        last_log_time = time.time()
-
-                    # 保存模型
-                    if update_count % 5 == 0:
-                        torch.save(agent.actor.state_dict(), weights_path)
-                        for k, v in shared_ctx['logs'].items():
-                            np.save(os.path.join(save_dir, f'{k}.npy'), list(v))
-
-                shared_ctx['weights'].update(agent.get_state_dict())
-
-                # === 恢复采集 (绿灯) ===
-                shared_ctx['events']['can_sample'].set()
-            else:
-                # 数据不够，主进程休息，让 Worker 跑
-                time.sleep(0.05)
-    except KeyboardInterrupt:
-        print("\n[Main] Training interrupted by user.")
-    finally:
-        print("\n[Main] Stopping workers and saving final model...")
-
-        # 1. 停止子进程
-        shared_ctx['events']['stop'].set()
-        [p.join() for p in processes]
-
-        # 2. 确保最后保存模型与日志
-        torch.save(agent.actor.state_dict(), weights_path)
-        for k, v in shared_ctx['logs'].items():
-            np.save(os.path.join(save_dir, f'{k}.npy'), list(v))
-
-        print("[Main] Training finished and saved.")
-
-
-def sample_worker(env_id, shared_memory, ctx, max_t, total_episodes, pid):
-    env = gym.make(env_id)
-    state_dim = int(np.prod(env.observation_space.shape))
-    current_ep = 0
-
-    # Worker Agent 初始化
-    local_agent = Agent_GRPO(state_dim, env.action_space.n, MINI_BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA,
-                             EPS_CLIP, K_EPOCHS, ENTROPY_COEF, DEVICE, manager=None, is_worker=True, adv_mode="tiered",
-                             global_baseline=ctx['baseline'], baseline_lock=ctx['locks']['baseline'])
-    # 初始加载权重
-    if len(ctx['weights']) > 0:
-        local_agent.load_state_dict(ctx['weights'])
-
-    while not ctx['events']['stop'].is_set():
-        # === 同步检查 ===
-        if not ctx['events']['can_sample'].wait(timeout=0.1):
-            continue  # 红灯，等待
-
-        # 每次开始一组新的采样前，确保载入最新权重
+@ray.remote
+class GRPOWorker:
+    def __init__(self, env_id, seed, worker_id, adv_mode="tiered"):
+        import gymnasium as gym
+        from envs.custom_merge_env import MergeEnv
         try:
-            local_agent.load_state_dict(ctx['weights'])
-        except Exception:
-            pass  # 避免极端的读写冲突，虽用 Manager 很少见
+            gym.make(env_id)
+        except gymnasium.error.NameNotFound:
+            gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
+        self.seed = seed + worker_id * 1000
+        np.random.seed(self.seed);
+        torch.manual_seed(self.seed)
+        self.env = gym.make(env_id)
+        # Worker 只负责推理，device='cpu' 通常更快且省显存
+        self.agent = Agent_GRPO_Ray(
+            int(np.prod(self.env.observation_space.shape)), self.env.action_space.n,
+            BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
+            ENTROPY_COEF, torch.device('cpu'), is_worker=True, adv_mode=adv_mode
+        )
 
-        # 1. 采集数据
-        # 组采样初始化 (Same-State Logic)
-        group_seed = random.randint(0, 1000000)
-        group_trajectories = []     # 存储轨迹数据
-        group_ep_speeds = []        # 用于日志
-        group_is_crashed = []       # 用于日志
+    def sample(self, weights, baseline, max_t):
+        self.agent.set_weights(weights)
+        group_trajs, metrics = [], {'rew': [], 'spd': [], 'col': []}
+        total_steps = 0
 
-        # 批量步数统计
-        local_steps_count = 0
-
+        # 组采样
+        group_seed = np.random.randint(0, 1e6)
         for _ in range(GROUP_SIZE):
-            state, _ = env.reset(seed=group_seed)
-            state = state.flatten()
+            s, _ = self.env.reset(seed=group_seed);
+            s = s.flatten()
+            traj = []
+            ep_r, ep_s = 0, []
+            for _ in range(max_t):
+                with torch.no_grad():
+                    a, lp = self.agent.act(torch.FloatTensor(s))
+                ns, r, term, trunc, info = self.env.step(a);
+                ns = ns.flatten()
+                traj.append((s, a, r, ns, term, lp))
+                ep_r += r;
+                ep_s.append(info.get('speed', 0));
+                s = ns
+                if term or trunc: break
 
-            steps = 0
-            ep_reward, ep_speed = 0, 0
-            traj_buffer = []
-            info = {}
+            group_trajs.append(traj)
+            total_steps += len(traj)
+            metrics['rew'].append(ep_r)
+            metrics['spd'].append(np.mean(ep_s) if ep_s else 0)
+            metrics['col'].append(1 if info.get('crashed') else 0)
 
-            done = False
-            while not done and steps < max_t:
-                state_tensor = torch.FloatTensor(state).to(local_agent.device)
-                action, log_prob = local_agent.act(state_tensor)
+        # 计算优势
+        advs, avg_rew, grp_mean = self.agent.calculate_group_advantages(group_trajs, baseline)
 
-                next_state, reward, term, trunc, info = env.step(action)
-                next_state = next_state.flatten()
+        # 组装 Batch
+        batch = []
+        for tr, adv in zip(group_trajs, advs):
+            for step in tr: batch.append((step[0], step[1], adv, step[3], step[4], step[5]))
 
-                # 【注意】done 传入的参数实际是 term（为了让 Agent 知道有没有撞车）
-                traj_buffer.append((state, action, reward, next_state, term, log_prob))
-
-                ep_reward += reward
-                ep_speed += state[2]
-                state = next_state.copy()
-                steps += 1
-                done = term or trunc
-
-            group_trajectories.append(traj_buffer)
-            group_ep_speeds.append(ep_speed / max(1, steps))
-            group_is_crashed.append(1 if info.get('crashed', False) else 0)
-
-            local_steps_count += steps
-
-        # 更新全局步数计数器
-        with ctx['step'].get_lock():
-            ctx['step'].value += local_steps_count
-
-        # 2. 计算优势
-        group_advantages, avg_group_reward = local_agent.calculate_group_advantages(group_trajectories)
-
-        # 3. 组装存储 & 日志同步
-        batch_to_add = []
-        # 只有在依然是绿灯的情况下才写入 (防止在计算过程中主进程喊停)
-        if ctx['events']['can_sample'].is_set():
-            # 同时遍历 "原始轨迹列表" 和 "计算好的优势列表"
-            # zip((traj1, traj2...), (adv1, adv2...)) -> [(traj1, adv1), (traj2, adv2)...]
-            for raw_traj, adv_val in zip(group_trajectories, group_advantages):
-                # advantage_val 是这一整条轨迹共享的优势值
-                # raw_trajectory 是这一条轨迹里的步骤列表: [(s,a,r...), (s,a,r...)]
-                for s, a, raw_reward, ns, d, lp in raw_traj:            # 原始数据
-                    # 将 reward 替换为 calculated advantage
-                    batch_to_add.append((s, a, adv_val, ns, d, lp))
-
-            # 批量写入共享内存
-            try:
-                shared_memory.extend(batch_to_add)
-            except BrokenPipeError:
-                break
-
-            # 同步日志
-            with ctx['locks']['episode']:
-                if ctx['episode'].value < total_episodes:
-                    ctx['episode'].value += GROUP_SIZE
-                    current_ep = ctx['episode'].value
-
-            with ctx['locks']['save']:
-                ctx['logs']['rewards'].append(avg_group_reward)
-                ctx['logs']['speed'].append(np.mean(group_ep_speeds))
-                ctx['logs']['collision'].append(np.mean(group_is_crashed))
-
-            if pid == 0:
-                print(f'\rEp {current_ep} GroupRew {avg_group_reward:.1f}', end='')
-
-    env.close()
+        return batch, metrics, grp_mean, total_steps
 
 
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
-    args = parse_args()
-    set_seed(args.seed)
-    save_dir = f'results/train/grpo_main/seed_{args.seed}'
-
-    with mp.Manager() as manager:
-        dummy = gym.make(RAM_ENV_NAME)
-        state_dim = int(np.prod(dummy.observation_space.shape))
-        act_dim = dummy.action_space.n
-        dummy.close()
-
-        agent = Agent_GRPO(state_dim, act_dim, MINI_BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP,
-                           K_EPOCHS, ENTROPY_COEF, DEVICE, manager=manager, is_worker=False, adv_mode="tiered")
-
-        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
-
-====================
-FILE: ./experiments/train_grpo_static_beta.py
-====================
-import sys, os, argparse
-import time
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from multiprocessing import Value
-import gymnasium as gym
-import torch.multiprocessing as mp
-from models.agent_grpo import Agent_GRPO
-from config.grpo_config import *
-from envs.custom_highway_env import HighwayEnv
-from envs.custom_merge_env import MergeEnv
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
+def train():
+    parser = argparse.ArgumentParser();
     parser.add_argument('--seed', type=int, default=0)
-    return parser.parse_args()
+    args = parser.parse_args()
 
+    ray.init()
+    save_dir = f'results/train/grpo_main/seed_{args.seed}'
+    os.makedirs(save_dir, exist_ok=True)
 
-def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
-    weights_path = os.path.join(save_dir, 'weights.pth')
-    param_queue = manager.Queue(maxsize=num_processes)
-    stop_event = manager.Event()
-    global_episode = Value('i', 0)
-    global_step = Value('i', 0)
-    episode_lock = manager.Lock()
-    save_lock = manager.Lock()
+    dummy = gym.make(RAM_ENV_NAME)
+    learner = Agent_GRPO_Ray(
+        int(np.prod(dummy.observation_space.shape)), dummy.action_space.n,
+        BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
+        ENTROPY_COEF, DEVICE, is_worker=False, adv_mode="tiered", use_dynamic_beta=True
+    )
 
-    # === 全局基准共享变量 ===
-    # 初始化为 0.0，Worker 内部逻辑会处理第一次赋值
-    global_baseline = manager.Value('d', 0.0)   # 'd' 表示 double (float64)
-    baseline_lock = manager.Lock()
+    workers = [GRPOWorker.remote(RAM_ENV_NAME, args.seed, i, "tiered") for i in range(NUM_PROCESSES)]
 
-    rewards_log = manager.list()
-    speed_log = manager.list()
-    collision_log = manager.list()
+    global_base, ema = 0.0, 0.95
+    step, ep = 0, 0
+    buffer, logs = [], {'rew': [], 'spd': [], 'col': []}
 
-    processes = []
-    for pid in range(num_processes):
-        # 注意：这里把 global_baseline 和 baseline_lock 传给 Worker
-        p = mp.Process(target=sample_worker, args=(
-            env_id, agent.memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
-            stop_event, max_t, save_lock, rewards_log, speed_log, collision_log, global_baseline, baseline_lock))
-        p.start()
-        processes.append(p)
+    print(f"🚀 GRPO (Main) Ray Training Started | Workers: {NUM_PROCESSES}")
 
-    initial_state_dict = agent.get_state_dict()
-    for _ in range(num_processes): param_queue.put(initial_state_dict)
-
-    last_log_time, update_count = time.time(), 0
     try:
-        while global_episode.value < total_episodes:
-            # 等待足够的数据 (Batch Size * Group Size 确保可以进行几次完整的组更新)
-            if len(agent.memory) >= BATCH_SIZE * 4:
-                with save_lock:
-                    agent.learn(global_step.value)
-                    update_count += 1
-                    if time.time() - last_log_time > 5:
-                        print(f"\n[GRPO-Static-Beta] Upd {update_count} | Step {global_step.value} | Ent {agent.entropy:.3f} | Beta {agent.beta:.6f} | Base {global_baseline.value:.2f}")
-                        last_log_time = time.time()
-                    if update_count % 5 == 0:
-                        torch.save(agent.actor.state_dict(), weights_path)
-                        np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
-                        np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
-                        np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+        while ep < RAM_NUM_EPISODE:
+            w_ref = ray.put(learner.get_weights())
+            results = ray.get([w.sample.remote(w_ref, global_base, MAX_T) for w in workers])
 
-                new_state_dict = agent.get_state_dict()
-                # 清空旧参数，广播新参数
-                while not param_queue.empty():
-                    try:
-                        param_queue.get_nowait()
-                    except:
-                        pass
-                for _ in range(num_processes): param_queue.put(new_state_dict)
-            time.sleep(0.1)
+            grp_means = []
+            for batch, m, gm, s in results:
+                buffer.extend(batch)
+                logs['rew'].extend(m['rew']);
+                logs['spd'].extend(m['spd']);
+                logs['col'].extend(m['col'])
+                grp_means.append(gm)
+                ep += GROUP_SIZE;
+                step += s
+
+            global_base = np.mean(grp_means) if global_base == 0 else ema * global_base + (1 - ema) * np.mean(grp_means)
+
+            if len(buffer) >= BATCH_SIZE:
+                learner.learn(buffer, step)
+                buffer = []
+                print(f"Ep {ep} | Step {step} | Rew {np.mean(logs['rew'][-100:]):.1f} | Base {global_base:.1f}")
+
+                if (ep // GROUP_SIZE) % 50 == 0:  # 稍微减少保存频率
+                    torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
+                    for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
+
     finally:
-        stop_event.set()
-        [p.join() for p in processes]
-
-    torch.save(agent.actor.state_dict(), weights_path)
-    np.save(os.path.join(save_dir, 'rewards.npy'), list(rewards_log))
-    np.save(os.path.join(save_dir, 'speed.npy'), list(speed_log))
-    np.save(os.path.join(save_dir, 'collision.npy'), list(collision_log))
+        ray.shutdown()
 
 
-def sample_worker(env_id, shared_memory, global_episode, global_step, total_episodes, episode_lock, pid, param_queue,
-                  stop_event, max_t, save_lock, rewards_log, speed_log, collision_log, global_baseline, baseline_lock):
-    env = gym.make(env_id)
-    state_dim = int(np.prod(env.observation_space.shape))
-
-    # [消融实验] use_dynamic_beta=False
-    local_agent = Agent_GRPO(state_dim, env.action_space.n, BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, LAMDA,
-                             EPS_CLIP, K_EPOCHS, ENTROPY_COEF, DEVICE, shared=False, manager=None, is_worker=True,
-                             use_dynamic_beta=False, global_baseline=global_baseline, baseline_lock=baseline_lock)
-    try:
-        local_agent.load_state_dict(param_queue.get(timeout=5))
-    except:
-        pass
-
-    while not stop_event.is_set():
-        # 1. 采集数据
-        # 组采样初始化 (Same-State Logic)
-        group_seed = random.randint(0, 1000000)
-
-        group_trajectories = []     # 存储轨迹数据
-        group_ep_speeds = []        # 用于日志
-        group_is_crashed = []       # 用于日志
-
-        for _ in range(GROUP_SIZE):
-            # 强制使用相同的种子重置环境
-            state, _ = env.reset(seed=group_seed)
-            state = state.flatten()
-
-            ep_reward, ep_speed = 0, 0
-            steps = 0
-            is_crashed = 0
-            done = False
-
-            traj_buffer = []    # 单条轨迹的 Buffer
-
-            while not done and steps < max_t:
-                state_tensor = torch.FloatTensor(state).to(local_agent.device)
-                action, log_prob = local_agent.act(state_tensor)
-
-                res = env.step(action)
-
-                # 确保使用的是 Gymnasium 而非旧版 gym，否则应改为 next_state, reward, done, info
-                # term=True 代表撞车/出界 (失败)
-                # trunc=True 代表时间到了 (存活)
-                next_state, reward, term, trunc, info = res
-                next_state = next_state.flatten()
-
-                # ！！请注意：done 传入的参数实际是 term（为了让 Agent 知道有没有撞车）
-                # 后续修改的时候注意
-                traj_buffer.append((state, action, reward, next_state, term, log_prob))
-
-                ep_reward += reward
-                is_crashed = 1 if term else 0
-                ep_speed += state[2]
-
-                state = next_state.copy()
-                steps += 1
-                done = term or trunc  # 循环控制
-
-            # 采集完一条，加入组列表
-            group_trajectories.append(traj_buffer)
-
-            # 记录辅助信息
-            group_ep_speeds.append(ep_speed / max(1, steps))
-            group_is_crashed.append(is_crashed)
-
-            # 更新全局步数计数器
-            with global_step.get_lock():
-                global_step.value += steps
-
-        # 2. 计算优势
-        group_advantages, avg_group_reward = local_agent.calculate_group_advantages(group_trajectories)
-
-        # 3. 组装与存储
-        # 我们同时遍历 "原始轨迹列表" 和 "计算好的优势列表"
-        # zip((traj1, traj2...), (adv1, adv2...)) -> [(traj1, adv1), (traj2, adv2)...]
-        for raw_trajectory, advantage_val in zip(group_trajectories, group_advantages):
-            # advantage_val 是这一整条轨迹共享的优势值 (标量)
-            # raw_trajectory 是这一条轨迹里的步骤列表: [(s,a,r...), (s,a,r...)]
-            for step_data in raw_trajectory:
-                # 1. 解包原始数据
-                s, a, raw_reward, ns, d, lp = step_data
-
-                # 2. 构造存入数据
-                # 重点：我们用 advantage_val 替换掉了 raw_reward
-                # GRPO 的核心思想：整个轨迹的好坏决定了其中每一步的好坏
-                data_to_store = (s, a, advantage_val, ns, d, lp)
-
-                # 3. 存入共享内存
-                shared_memory.remember(data_to_store)
-
-        # 4. 日志与同步
-        with episode_lock:
-            if global_episode.value < total_episodes:
-                global_episode.value += GROUP_SIZE
-                ep = global_episode.value
-
-        with save_lock:
-            # 记录平均值
-            rewards_log.append(avg_group_reward)
-            speed_log.append(np.mean(group_ep_speeds))
-            collision_log.append(np.mean(group_is_crashed))
-
-        if pid == 0:
-            print(f'\rEp {ep} GroupRew {avg_group_reward:.1f}', end='')
-
-        # 检查是否有新参数，更新 Worker 的网络
-        if not param_queue.empty():
-            try:
-                local_agent.load_state_dict(param_queue.get_nowait())
-            except:
-                pass
-
-    env.close()
-
-
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
-    args = parse_args()
-    set_seed(args.seed)
-    save_dir = f'results/grpo_static_beta/seed_{args.seed}'
-
-    with mp.Manager() as manager:
-        dummy = gym.make(RAM_ENV_NAME)
-        state_dim = int(np.prod(dummy.observation_space.shape))
-        act_dim = dummy.action_space.n
-        dummy.close()
-
-        agent = Agent_GRPO(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, LAMDA, EPS_CLIP,
-                           K_EPOCHS, ENTROPY_COEF, DEVICE, shared=False, manager=manager, is_worker=False,
-                           use_dynamic_beta=False)
-
-        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+if __name__ == '__main__': train()
 
 ====================
 FILE: ./experiments/train_grpo_standard.py
 ====================
-import sys, os, argparse
-import time
+import sys, os, time, argparse, numpy as np, torch, gymnasium as gym, ray
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from multiprocessing import Value
-import gymnasium as gym
-import torch.multiprocessing as mp
-
-from models.agent_grpo import Agent_GRPO
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.grpo_config import *
-
-from envs.custom_highway_env import HighwayEnv
+from models.agent_grpo_ray import Agent_GRPO_Ray
 from envs.custom_merge_env import MergeEnv
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    return parser.parse_args()
+gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-def main_optimizer(env_id, num_processes, total_episodes, max_t, agent, manager, save_dir):
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
-    weights_path = os.path.join(save_dir, 'weights.pth')
-
-    # shared_context
-    shared_ctx = {
-        'episode': Value('i', 0),   # global_episode
-        'step': Value('i', 0),      # global_step
-        'baseline': manager.Value('d', 0.0),            # global_baseline
-
-        # 移除 param_queue，改用 manager.dict()
-        # 原因：Queue 需要不断 put/get 还要清空，dict 直接 update 覆盖即可，天然线程安全
-        'weights': manager.dict(),
-
-        'logs': {
-            'rewards': manager.list(),
-            'speed': manager.list(),
-            'collision': manager.list()
-        },
-        'locks': {
-            'episode': manager.Lock(),
-            'save': manager.Lock(),
-            'baseline': manager.Lock()
-        },
-        'events': {
-            'stop': manager.Event(),
-            'can_sample': manager.Event()  # 对应原来的 update_event
-        }
-    }
-
-    # 初始设置
-    shared_ctx['events']['can_sample'].set()    # 绿灯
-    shared_ctx['weights'].update(agent.get_state_dict())    # 初始权重
-
-    processes = []
-    for pid in range(num_processes):
-        p = mp.Process(target=sample_worker, args=(env_id, agent.memory, shared_ctx, max_t, total_episodes, pid))
-        p.start()
-        processes.append(p)
-
-    last_log_time, update_count = time.time(), 0
-
-    try:
-        while shared_ctx['episode'].value < total_episodes:
-            if len(agent.memory) >= BATCH_SIZE:
-                # === 进入训练阶段 (红灯) ===
-                shared_ctx['events']['can_sample'].clear()  # 命令所有 Worker 停手
-                time.sleep(0.1) # 确保所有 Worker 跑完当前手头的这一轮 Group
-
-                with shared_ctx['locks']['save']:
-                    # 训练
-                    agent.learn(shared_ctx['step'].value)
-                    agent.memory.clear()
-                    update_count += 1
-
-                    # 日志打印
-                    if time.time() - last_log_time > 5:
-                        print(f"\n[GRPO-standard] Upd {update_count} | Step {shared_ctx['step'].value} | Ent {agent.entropy:.3f}")
-                        last_log_time = time.time()
-
-                    # 保存模型
-                    if update_count % 5 == 0:
-                        torch.save(agent.actor.state_dict(), weights_path)
-                        for k, v in shared_ctx['logs'].items():
-                            np.save(os.path.join(save_dir, f'{k}.npy'), list(v))
-
-                shared_ctx['weights'].update(agent.get_state_dict())
-
-                # === 恢复采集 (绿灯) ===
-                shared_ctx['events']['can_sample'].set()
-            else:
-                # 数据不够，主进程休息，让 Worker 跑
-                time.sleep(0.05)
-    except KeyboardInterrupt:
-        print("\n[Main] Training interrupted by user.")
-    finally:
-        print("\n[Main] Stopping workers and saving final model...")
-
-        # 1. 停止子进程
-        shared_ctx['events']['stop'].set()
-        [p.join() for p in processes]
-
-        # 2. 确保最后保存模型与日志
-        torch.save(agent.actor.state_dict(), weights_path)
-        for k, v in shared_ctx['logs'].items():
-            np.save(os.path.join(save_dir, f'{k}.npy'), list(v))
-
-        print("[Main] Training finished and saved.")
-
-
-def sample_worker(env_id, shared_memory, ctx, max_t, total_episodes, pid):
-    env = gym.make(env_id)
-    state_dim = int(np.prod(env.observation_space.shape))
-    current_ep = 0
-
-    # Worker Agent 初始化
-    local_agent = Agent_GRPO(state_dim, env.action_space.n, MINI_BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA,
-                             EPS_CLIP, K_EPOCHS, ENTROPY_COEF, DEVICE, manager=None, is_worker=True, adv_mode="standard",
-                             global_baseline=ctx['baseline'], baseline_lock=ctx['locks']['baseline'])
-    # 初始加载权重
-    if len(ctx['weights']) > 0:
-        local_agent.load_state_dict(ctx['weights'])
-
-    while not ctx['events']['stop'].is_set():
-        # === 同步检查 ===
-        if not ctx['events']['can_sample'].wait(timeout=0.1):
-            continue  # 红灯，等待
-
-        # 每次开始一组新的采样前，确保载入最新权重
+# 复用 Worker 类结构，但初始化参数不同
+@ray.remote
+class GRPOWorker:
+    def __init__(self, env_id, seed, worker_id, adv_mode="standard"):
+        import gymnasium as gym
+        from envs.custom_merge_env import MergeEnv
         try:
-            local_agent.load_state_dict(ctx['weights'])
-        except Exception:
-            pass  # 避免极端的读写冲突，虽用 Manager 很少见
+            gym.make(env_id)
+        except gymnasium.error.NameNotFound:
 
-        # 1. 采集数据
-        # 组采样初始化 (Same-State Logic)
-        group_seed = random.randint(0, 1000000)
-        group_trajectories = []     # 存储轨迹数据
-        group_ep_speeds = []        # 用于日志
-        group_is_crashed = []       # 用于日志
+            gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
+        self.seed = seed + worker_id * 1000
+        np.random.seed(self.seed);
+        torch.manual_seed(self.seed)
+        self.env = gym.make(env_id)
+        self.agent = Agent_GRPO_Ray(
+            int(np.prod(self.env.observation_space.shape)), self.env.action_space.n,
+            BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
+            ENTROPY_COEF, torch.device('cpu'), is_worker=True, adv_mode=adv_mode
+        )
 
-        # 批量步数统计
-        local_steps_count = 0
+    def sample(self, weights, baseline, max_t):
+        self.agent.set_weights(weights)
+        group_trajs, metrics = [], {'rew': [], 'spd': [], 'col': []}
+        total_steps = 0
+        group_seed = np.random.randint(0, 1e6)
 
         for _ in range(GROUP_SIZE):
-            state, _ = env.reset(seed=group_seed)
-            state = state.flatten()
+            s, _ = self.env.reset(seed=group_seed);
+            s = s.flatten()
+            traj, ep_r, ep_s = [], 0, []
+            for _ in range(max_t):
+                with torch.no_grad():
+                    a, lp = self.agent.act(torch.FloatTensor(s))
+                ns, r, term, trunc, info = self.env.step(a);
+                ns = ns.flatten()
+                traj.append((s, a, r, ns, term, lp))
+                ep_r += r;
+                ep_s.append(info.get('speed', 0));
+                s = ns
+                if term or trunc: break
+            group_trajs.append(traj);
+            total_steps += len(traj)
+            metrics['rew'].append(ep_r);
+            metrics['spd'].append(np.mean(ep_s) if ep_s else 0)
+            metrics['col'].append(1 if info.get('crashed') else 0)
 
-            steps = 0
-            ep_reward, ep_speed = 0, 0
-            traj_buffer = []
-            info = {}
-
-            done = False
-            while not done and steps < max_t:
-                state_tensor = torch.FloatTensor(state).to(local_agent.device)
-                action, log_prob = local_agent.act(state_tensor)
-
-                next_state, reward, term, trunc, info = env.step(action)
-                next_state = next_state.flatten()
-
-                # 【注意】done 传入的参数实际是 term（为了让 Agent 知道有没有撞车）
-                traj_buffer.append((state, action, reward, next_state, term, log_prob))
-
-                ep_reward += reward
-                ep_speed += state[2]
-                state = next_state.copy()
-                steps += 1
-                done = term or trunc
-
-            group_trajectories.append(traj_buffer)
-            group_ep_speeds.append(ep_speed / max(1, steps))
-            group_is_crashed.append(1 if info.get('crashed', False) else 0)
-
-            local_steps_count += steps
-
-        # 更新全局步数计数器
-        with ctx['step'].get_lock():
-            ctx['step'].value += local_steps_count
-
-        # 2. 计算优势
-        group_advantages, avg_group_reward = local_agent.calculate_group_advantages(group_trajectories)
-
-        # 3. 组装存储 & 日志同步
-        batch_to_add = []
-        # 只有在依然是绿灯的情况下才写入 (防止在计算过程中主进程喊停)
-        if ctx['events']['can_sample'].is_set():
-            # 同时遍历 "原始轨迹列表" 和 "计算好的优势列表"
-            # zip((traj1, traj2...), (adv1, adv2...)) -> [(traj1, adv1), (traj2, adv2)...]
-            for raw_traj, adv_val in zip(group_trajectories, group_advantages):
-                # advantage_val 是这一整条轨迹共享的优势值
-                # raw_trajectory 是这一条轨迹里的步骤列表: [(s,a,r...), (s,a,r...)]
-                for s, a, raw_reward, ns, d, lp in raw_traj:            # 原始数据
-                    # 将 reward 替换为 calculated advantage
-                    batch_to_add.append((s, a, adv_val, ns, d, lp))
-
-            # 批量写入共享内存
-            try:
-                shared_memory.extend(batch_to_add)
-            except BrokenPipeError:
-                break
-
-            # 同步日志
-            with ctx['locks']['episode']:
-                if ctx['episode'].value < total_episodes:
-                    ctx['episode'].value += GROUP_SIZE
-                    current_ep = ctx['episode'].value
-
-            with ctx['locks']['save']:
-                ctx['logs']['rewards'].append(avg_group_reward)
-                ctx['logs']['speed'].append(np.mean(group_ep_speeds))
-                ctx['logs']['collision'].append(np.mean(group_is_crashed))
-
-            if pid == 0:
-                print(f'\rEp {current_ep} GroupRew {avg_group_reward:.1f}', end='')
-
-    env.close()
+        advs, avg_rew, grp_mean = self.agent.calculate_group_advantages(group_trajs, baseline)
+        batch = []
+        for tr, adv in zip(group_trajs, advs):
+            for step in tr: batch.append((step[0], step[1], adv, step[3], step[4], step[5]))
+        return batch, metrics, grp_mean, total_steps
 
 
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
-    args = parse_args()
-    set_seed(args.seed)
+def train():
+    parser = argparse.ArgumentParser();
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+
+    ray.init()
     save_dir = f'results/train/grpo_standard/seed_{args.seed}'
+    os.makedirs(save_dir, exist_ok=True)
 
-    with mp.Manager() as manager:
-        dummy = gym.make(RAM_ENV_NAME)
-        state_dim = int(np.prod(dummy.observation_space.shape))
-        act_dim = dummy.action_space.n
-        dummy.close()
+    dummy = gym.make(RAM_ENV_NAME)
+    # 注意这里 adv_mode="standard"
+    learner = Agent_GRPO_Ray(
+        int(np.prod(dummy.observation_space.shape)), dummy.action_space.n,
+        BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
+        ENTROPY_COEF, DEVICE, is_worker=False, adv_mode="standard", use_dynamic_beta=True
+    )
 
-        agent = Agent_GRPO(state_dim, act_dim, MINI_BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP,
-                           K_EPOCHS, ENTROPY_COEF, DEVICE, manager=manager, is_worker=False, adv_mode="standard")
+    # 启动 Worker 时也传入 standard
+    workers = [GRPOWorker.remote(RAM_ENV_NAME, args.seed, i, "standard") for i in range(NUM_PROCESSES)]
 
-        main_optimizer(RAM_ENV_NAME, NUM_PROCESSES, RAM_NUM_EPISODE, MAX_T, agent, manager, save_dir)
+    global_base, ema, step, ep, buffer = 0.0, 0.95, 0, 0, []
+    logs = {'rew': [], 'spd': [], 'col': []}
+
+    print(f"🚀 GRPO (Standard) Ray Training Started")
+
+    try:
+        while ep < RAM_NUM_EPISODE:
+            w_ref = ray.put(learner.get_weights())
+            results = ray.get([w.sample.remote(w_ref, global_base, MAX_T) for w in workers])
+
+            grp_means = []
+            for batch, m, gm, s in results:
+                buffer.extend(batch)
+                logs['rew'].extend(m['rew']);
+                logs['spd'].extend(m['spd']);
+                logs['col'].extend(m['col'])
+                grp_means.append(gm);
+                ep += GROUP_SIZE;
+                step += s
+
+            global_base = np.mean(grp_means) if global_base == 0 else ema * global_base + (1 - ema) * np.mean(grp_means)
+
+            if len(buffer) >= BATCH_SIZE:
+                learner.learn(buffer, step)
+                buffer = []
+                print(f"Ep {ep} | Step {step} | Rew {np.mean(logs['rew'][-100:]):.1f}")
+                if (ep // GROUP_SIZE) % 50 == 0:
+                    torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
+                    for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
+    finally:
+        ray.shutdown()
+
+
+if __name__ == '__main__': train()
 
 ====================
-FILE: ./models/__init__.py
-====================
-
-
-====================
-FILE: ./models/agent_grpo.py
+FILE: ./models/agent_grpo_ray.py
 ====================
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-import torch.nn as nn
 import numpy as np
-from numpy.random import standard_t
-
 from models.networks import Actor
-from models.rollout_buffer import Rollout_Buffer
 
-class Agent_GRPO:
 
+class Agent_GRPO_Ray:
     def __init__(self, state_size, action_size, bs, lr, decay_max_step, gamma, eps_clip, K_epochs, entropy_coef,
-                 device, manager=None, is_worker=False, adv_mode="tiered", global_baseline=None, baseline_lock=None):
+                 device, is_worker=False, adv_mode="tiered", use_dynamic_beta=True):
         self.state_size = state_size
         self.action_size = action_size
         self.bs = bs
@@ -1818,32 +1465,41 @@ class Agent_GRPO:
         self.K_epochs = K_epochs
         self.entropy_coef = entropy_coef
         self.device = device
-        self.scales = {'x': 500, 'y': 40, 'vx': 40, 'vy': 40}  # 环境 features_range（用于反归一化）
+        # self.scales 已删除，因为不再需要物理坐标反归一化
         self.entropy = 0
 
-        self.memory = Rollout_Buffer(manager)
+        # 网络初始化
         self.actor = Actor(state_size, action_size).to(device)
 
         if not is_worker:
             self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
+        else:
+            self.optimizer = None
 
-        # 动态 Beta 相关变量
-        self.beta = 0.1
-
-        # 优势计算方式
+        # GRPO 变体配置
         self.adv_mode = adv_mode
-
-        # 全局基准相关变量
-        self.global_baseline = global_baseline
-        self.baseline_lock = baseline_lock
-        self.ema_beta = 0.95  # 遗忘因子：0.95 代表非常重视历史，0.5 代表更新很快
-
+        self.use_dynamic_beta = use_dynamic_beta
+        self.beta = 0.1  # 初始 beta
 
     def act(self, state, deterministic=False):
-        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        # 1. 转为 Tensor
+        if not isinstance(state, torch.Tensor):
+            state = torch.FloatTensor(state).to(self.device)
+
+        # === 🛡️ 鲁棒性保护：输入清洗 ===
+        # 防止环境偶尔产生的 NaN 导致网络崩溃
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            state = torch.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
 
         with torch.no_grad():
             action_probs = self.actor(state)
+
+        # === 🛡️ 鲁棒性保护：输出清洗 ===
+        if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+            action_probs = torch.ones_like(action_probs) / self.action_size
 
         if deterministic:
             action_tensor = torch.argmax(action_probs, dim=1)
@@ -1853,303 +1509,126 @@ class Agent_GRPO:
             action_tensor = dist.sample()
             log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
 
-        action_val = action_tensor.cpu().numpy().flatten()
-        return int(action_val[0]), log_prob
+        return int(action_tensor.cpu().numpy().flatten()[0]), log_prob
 
-    def calculate_risk(self, state):
-        """
-        TTC 风险计算 (Time-to-Collision)
-            本质上就是把 ACC（自适应巡航）和 AEB（自动紧急制动）中最核心的物理判定公式，转化为了一个“风险数值”
-            TTC = dist_x / relative_speed
-            TTC_Risk = threshold / TTC
-        距离保持风险 (Headway Risk)
-            Headway_Risk = (Intrusion / k) ^ 2.0
-        输入 state 形状: (Total_Steps, 75)
-        输出 normalized_risk 形状:  (Total_Steps, )
-        """
-        ttc_threshold = 8.0     # TTC 阈值
+    def get_weights(self):
+        """导出权重到 CPU (Ray 传输用)"""
+        return {k: v.cpu() for k, v in self.actor.state_dict().items()}
 
-        # 需要把 state 重塑成: (Batch_Size, 15, 5) -> (Batch, 车辆数, 特征数)，方便后续使用 [:, 0, 0] 这种索引
-        batch_size = state.shape[0]
-        num_features = 6  # x, y, vx, vy, heading
-        num_vehicles = state.shape[1] // num_features  # 车辆数 (75 / 5 = 15)
-        reshaped_state = state.view(batch_size, num_vehicles, num_features)  # 不改变原数据
+    def set_weights(self, weights):
+        """加载权重"""
+        self.actor.load_state_dict(weights)
 
-        # Ego is at index 0
-        ego_x = reshaped_state[:, 0, 0:1] * self.scales['x']  # shape: (Batch, 1)
-        ego_y = reshaped_state[:, 0, 1:2] * self.scales['y']
-        ego_vx = reshaped_state[:, 0, 2:3] * self.scales['vx']
+    # [已删除] calculate_risk 函数
 
-        # Others are at indices 1
-        other_x = reshaped_state[:, 1:, 0] * self.scales['x']  # shape: (Batch, N-1)
-        other_y = reshaped_state[:, 1:, 1] * self.scales['y']
-        other_vx = reshaped_state[:, 1:, 2] * self.scales['vx']
-
-        # 计算与周围车辆的相对位置和相对速度（接近速度）
-        delta_x = other_x - ego_x
-        delta_y = other_y - ego_y
-        rel_vx = other_vx - ego_vx
-
-        # --- 关键掩码 (ACC 逻辑的核心) ---
-        # A. 距离掩码 (太远的不用管)
-        # 这里的 dists 只看 X 轴距离
-        dists_x = torch.abs(delta_x) + 1e-6
-        is_close_enough = dists_x < 80.0  # ACC 雷达探测范围
-
-        # B. 同车道掩码 (Lane Filter)
-        # 假设车道宽度约 4米，如果 Y 轴偏差 < 2.0米，说明在同一条道
-        is_same_lane = torch.abs(delta_y) < 2.0
-
-        # C. 前方掩码 (Front Filter)
-        # 只管前面的车，不管后面的车
-        is_in_front = delta_x > 0
-
-        # D. 正在靠近掩码 (Closing Speed)
-        # 只有当前车比我慢 (rel_vx < 0) 时，才存在 TTC 风险
-        is_closing = rel_vx < -0.1
-
-        # E. 有效性掩码 (排除 Padding 和 已经撞上的)
-        is_not_padding = dists_x > 0.1  # 判断真车：距离 > 0.1米 认为是真车，0.0 是填充位
-        is_not_crashed = dists_x > 0.6  # 判断碰撞，稍微宽容一点，撞上之后风险归零交给 Reward 惩罚
-
-        # --- 综合有效目标掩码 ---
-        # 必须同时满足: 在同车道 AND 在前面 AND 是真车 AND 没撞上
-        valid_target_mask = is_same_lane & is_in_front & is_not_padding & is_not_crashed & is_close_enough
-
-        # --- 风险计算 (仅 X 轴) ---
-        # 1. TTC 风险 (Time To Collision)
-        # TTC = dist_x / relative_speed
-        # Risk = threshold / TTC = threshold * relative_speed / dist_x
-        # 只有正在靠近的目标才计算 TTC
-        ttc_mask = valid_target_mask & is_closing
-
-        # 取反，变成正数表示靠近速度
-        closing_speed = -rel_vx
-
-        dists_x = torch.clamp(dists_x, min=0.5)
-        ttc_risk = torch.zeros_like(dists_x)
-        ttc_risk[ttc_mask] = ttc_threshold * closing_speed[ttc_mask] / dists_x[ttc_mask]
-
-        # 2. 距离保持风险 (Headway Risk)
-        # 即使相对静止，如果贴得太近 (比如 < 32米)，也是高风险
-        # 使用指数函数或者高次幂，让近距离的风险值爆炸
-        # 逻辑：(Intrusion / 5.0) ^ 2.0
-        #   距离 30m -> Intrusion 0  -> Risk 0
-        #   距离 25m -> Intrusion 5  -> Risk (5/5)^2 = 1.0 (开始有警觉)
-        #   距离 15m -> Intrusion 15 -> Risk (15/5)^2 = 9.0 (高风险)
-        #   距离 10m -> Intrusion 20 -> Risk (20/5)^2 = 16.0 (极大风险)
-        #   距离 5m  -> Intrusion 25 -> Risk (25/5)^2 = 25.0 (极度危险)
-        dist_risk = torch.zeros_like(dists_x)
-        safe_dist = 30.0    # 最小车距
-        intrusion = torch.clamp(safe_dist - dists_x, min=0.0)   # 侵入量，dists > safe_dist 时为 0，不计算距离风险
-        dist_risk[valid_target_mask] = (intrusion[valid_target_mask] / 5.0).pow(2)
-
-        # 3. 计算综合风险
-        total_risk = torch.max(ttc_risk, dist_risk)
-        total_risk = total_risk * valid_target_mask.float()      # 确认强制把无效位置归零
-
-        # 找出每辆车正前方最危险的那辆车
-        max_total_risk, _ = torch.max(total_risk, dim=1)
-
-        # --- 数值归一化映射 ---
-        # 优化线性截断，用 tanh 函数做软饱和，尽量避免使用 clamp 做硬截断
-        # 固定物理缩放系数（0.2），不再调整
-        #   max_risk = 4  -> tanh(0.4) = 0.38 (低风险)
-        #   max_risk = 8  -> tanh(0.8) = 0.66 (中高风险)
-        #   max_risk = 20 -> tanh(2.0) = 0.96 (极高风险)
-        normalized_risk = torch.tanh(max_total_risk * 0.1)
-
-        return normalized_risk
-
-    def calculate_group_advantages(self, group_trajectories):
-        """
-        引入 分层 Advantage (Tiered Advantage)策略
-            优先级：生存 > 速度
-        引入 EMA Global Baseline
-        """
+    def calculate_group_advantages(self, group_trajectories, baseline_value):
         group_returns = []
-        group_crashed = []  # 记录每条轨迹是否最终撞车
-        group_rewards = []  # 用来存真实总奖励
+        group_crashed = []
 
-        states_list = []    # 用来存所有轨迹的所有 Step 的 State，最后拼成大 Batch
-        traj_lengths = []   # 记录每条轨迹有多长，方便最后切分结果
-
-        # 计算每条轨迹的 Monte-Carlo Return
+        # 1. 计算每条轨迹的回报 (Return)
         for traj in group_trajectories:
             G = 0
-            ep_reward = 0
-            current_traj_states = []    # 临时存放这条轨迹的所有 State，用于计算 Max Risk，不关心顺序
-
-            # traj 结构是 tuple (s, a, r, ns, term, lp)
+            # 倒序计算
             for t in reversed(range(len(traj))):
-                s = traj[t][0]
-                r = traj[t][2]
-
+                s, a, r, ns, term, lp = traj[t]
                 G = r + self.gamma * G
-                ep_reward += r
-
-                # Tiered 模式需要收集 State
-                if self.adv_mode == "tiered":
-                    current_traj_states.append(s)   # 注意：此处 state 是倒叙收集的（后续 risk 计算取 max 不受影响）
-
-            # 碰撞判断
-            term = traj[-1][4]  # 只看最后一步
-            crashed = True if term else False
 
             group_returns.append(G)
-            group_crashed.append(crashed)
-            group_rewards.append(ep_reward)     # 记录真实总奖励
-            if self.adv_mode == "tiered":
-                states_list.extend(current_traj_states)         # 把这一串 state 加到总列表
-                traj_lengths.append(len(current_traj_states))   # 记录长度
+            # term 位于 tuple 的第4位 (index 4)
+            group_crashed.append(traj[-1][4])
 
-        # 转为 numpy
         group_returns_arr = np.array(group_returns)
-        group_crashed_arr = np.array(group_crashed)
-        avg_group_reward = np.mean(group_rewards)
 
-        # === 批量计算 Risk (Batch Processing) ===
-        group_risks_arr = np.zeros(len(group_returns), dtype=np.float32)
-        if self.adv_mode == "tiered" and len(states_list) > 0:
-            # 把所有 state 拼到一起 (Total_Steps, 75)
-            all_states = torch.FloatTensor(np.array(states_list)).to(self.device)
-            with torch.no_grad():
-                # 算出所有时刻的 risk
-                all_risks = self.calculate_risk(all_states)
-
-                # 按照 traj_lengths 切分回 16 条轨迹
-                traj_risks = torch.split(all_risks, traj_lengths)
-
-                # 对每条轨迹取风险最大值作为该轨迹的风险
-                group_risks_arr = np.array([chunk.max().item() for chunk in traj_risks])
-
-
-
-        # === 计算优势 (Batch Processing) ===
-        # 传统 GRPO (Standard): 直接组内正态分布归一化
-        # 优点：数学纯粹，方差低
-        # 缺点：在稀疏奖励或生存任务中，如果全员表现都很差，稍微好一点的“烂操作”也会得到高正分
-        # 转为 numpy
+        # 2. 计算标准优势 (Z-Score Normalization)
+        # 这是 GRPO 的核心：(Return - Mean) / Std
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
-        standard_adv = (group_returns_arr - group_mean) / group_std
+        final_adv = (group_returns_arr - group_mean) / group_std
 
-        # 默认情况下，最终优势就是标准优势, 使用 copy 防止后续的操作影响 standard_adv
-        final_adv = standard_adv.copy()
+        # 3. Tiered Advantage 调整 (无 Risk 版本)
+        # 逻辑：保留“幸存者”与“撞车者”的分层，保留“Global Trend”奖励
+        if self.adv_mode == "tiered":
+            # 计算趋势信号：这组表现比历史基准(baseline)好了多少？
+            trend = np.clip((group_mean - baseline_value), -1.0, 1.0)
 
-        if self.adv_mode == "standard":
-            # 传统 GRPO (Standard)
-            pass
-        elif self.adv_mode == "tiered":
-            # 分层策略 (结合 EMA Global Baseline)
-            tiered_adv = standard_adv.copy()
-            # 1. 更新 EMA Global Baseline (无论何种情况都更新)
-            # 即使这组表现很烂，也要计入历史，保证 Baseline 真实反映训练曲线
-            trend_signal = 0.0
-            if self.global_baseline is not None and self.baseline_lock is not None:
-                with self.baseline_lock:
-                    current_baseline = self.global_baseline.value
-                    if current_baseline == 0.0:
-                        new_baseline = group_mean
-                    else:
-                        new_baseline = self.ema_beta * current_baseline + (1 - self.ema_beta) * group_mean
-                    self.global_baseline.value = new_baseline
+            survivor_mask = ~np.array(group_crashed, dtype=bool)
+            crasher_mask = np.array(group_crashed, dtype=bool)
 
-                # 计算趋势信号: 这组表现比历史基准好了多少？
-                # 限制幅度在 [-1, 1] 之间，防止初期波动过大
-                trend_signal = np.clip((group_mean - new_baseline), -1.0, 1.0)
+            if np.any(survivor_mask):
+                # 幸存者优势 = 原始排名 + 趋势奖励
+                # (去掉了之前的 "- surv_risks")
+                surv_adv = final_adv[survivor_mask] + (0.2 * trend)
 
-            # 2. 计算 Advantage (融合逻辑)
-            # 分层 Advantage (Tiered Advantage) 解决 “组内辨识度” 问题
-            # EMA Global Baseline 解决 “整体进化” 问题
-            survivor_mask = ~group_crashed_arr
-            crasher_mask = group_crashed_arr
-            has_survivor = np.any(survivor_mask)   # 是否有人存活
-            has_crasher = np.any(crasher_mask)     # 是否有人撞车
+                # 幸存者内部再次归一化 (让幸存者之间也能分出高下)
+                if len(surv_adv) > 1:
+                    surv_adv = (surv_adv - surv_adv.mean()) / (surv_adv.std() + 1e-8)
 
-            # 处理幸存者
-            if has_survivor:
-                # 提取风险值
-                surv_risks = group_risks_arr[survivor_mask].reshape(-1)
+                final_adv[survivor_mask] = surv_adv
 
-                # 引入 EMA Trend 来防止陷入局部最优
-                #   如果全组都比历史好，大家一起加分；如果全组都比历史差，大家一起扣分
-                # Advantage = 组内排名 - 风险惩罚 + 历史进步
-                surv_adv = tiered_adv[survivor_mask] - surv_risks + (0.2 * trend_signal)
-
-                # 组内二次归一化：让幸存者之间决出高下
-                # 注意：如果只有1个幸存者，std为0，分母加 1e-8 防止报错，结果会变成 0.0
-                surv_mean = surv_adv.mean()
-                surv_std = surv_adv.std() + 1e-8
-                surv_norm = (surv_adv - surv_mean) / surv_std
-
-                # 即使归一化后分很高，如果 Risk 过大，依旧不是好的表现
-                is_dangerous = surv_risks > 0.8
-                surv_norm[is_dangerous] -= 2.0 * surv_risks[is_dangerous]
-
-                final_adv[survivor_mask] = surv_norm
-            if has_crasher:
-                if has_survivor:
-                    # 既有活下来的，又有撞死的
-                    # 撞车者得分 = 最差存活者得分 - 巨大惩罚
+            if np.any(crasher_mask):
+                if np.any(survivor_mask):
+                    # 撞车者的得分，必须比最差的幸存者还要低 (分层打击)
                     final_adv[crasher_mask] = final_adv[survivor_mask].min() - 2.0
                 else:
-                    # 全员撞车
-                    # 全员在基础分上再扣一分
+                    # 全员撞车，全员扣分
                     final_adv[crasher_mask] -= 1.0
 
-        # Clip Advantage 保证数值稳定
+        # 截断，防止梯度爆炸
         final_adv = np.clip(final_adv, -4.0, 4.0)
 
-        return final_adv, avg_group_reward
+        # 计算单纯的 Reward 之和 (用于日志显示，不参与更新)
+        avg_rew = np.mean([sum(t[2] for t in tr) for tr in group_trajectories])
 
-    def learn(self, current_total_timesteps):
-        states, actions, advantages, next_states, dones, logprobs = self.memory.get_all_and_clear()
+        return final_adv, avg_rew, group_mean
 
-        if states is None or len(states) < self.bs:
-            return
+    def learn(self, memory_list, current_total_timesteps):
+        if not memory_list or len(memory_list) < self.bs: return
 
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        advantages = advantages.to(self.device)
-        logprobs = logprobs.to(self.device)
+        # 解包数据 (Ray 传回来的是 list of tuples)
+        states, actions, rewards, next_states, dones, log_probs = zip(*memory_list)
+
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.long).to(self.device)
+        advantages = torch.tensor(np.array(rewards), dtype=torch.float32).to(
+            self.device)  # 注意：这里的 rewards 实际上存的是 Advantage
+        old_log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32).to(self.device)
+
+        # === 🛡️ 训练数据保护 ===
+        if torch.isnan(states).any(): states = torch.nan_to_num(states, nan=0.0)
+        if torch.isnan(advantages).any(): advantages = torch.nan_to_num(advantages, nan=0.0)
 
         # 学习率线性衰减
         decay = 1.0 - min(max(current_total_timesteps / self.decay_max_step, 0.0), 1.0)
-        current_lr = self.lr * decay
-        for pg in self.optimizer.param_groups:
-            # 设个下限，防止完全变成 0 (通常保留初始值的 1% 或 1e-6)
-            pg['lr'] = max(current_lr, 1e-6)
+        cur_lr = self.lr * decay
+        for pg in self.optimizer.param_groups: pg['lr'] = max(cur_lr, 1e-6)
 
-        dataset_size = states.size(0)
-        indices = np.arange(dataset_size)
+        ds_size = states.size(0)
+        indices = np.arange(ds_size)
 
         for _ in range(self.K_epochs):
             np.random.shuffle(indices)
-            for start in range(0, dataset_size, self.bs):
-                end = start + self.bs
-                idx = indices[start:end]
+            for start in range(0, ds_size, self.bs):
+                idx = indices[start:start + self.bs]
+                mb_s, mb_a, mb_adv, mb_old_lp = states[idx], actions[idx], advantages[idx], old_log_probs[idx]
 
-                mb_states = states[idx]
-                mb_actions = actions[idx]
-                mb_old_log = logprobs[idx]
-                mb_adv = advantages[idx]  # 直接使用
-
-                action_probs = self.actor(mb_states)
+                action_probs = self.actor(mb_s)
                 dist = torch.distributions.Categorical(action_probs)
-                mb_new_log = dist.log_prob(mb_actions)
+                mb_new_lp = dist.log_prob(mb_a)
                 dist_entropy = dist.entropy().mean()
 
-                with torch.no_grad():
-                    approx_kl = 0.5 * ((mb_new_log - mb_old_log) ** 2).mean()
-
-                ratio = torch.exp(mb_new_log - mb_old_log)
+                ratio = torch.exp(mb_new_lp - mb_old_lp)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
 
-                loss = -torch.min(surr1, surr2).mean() + \
-                       self.beta * approx_kl - \
-                       self.entropy_coef * dist_entropy
+                # KL 散度近似 (用于动态 Beta)
+                with torch.no_grad():
+                    approx_kl = 0.5 * ((mb_new_lp - mb_old_lp) ** 2).mean()
+
+                # Loss 计算
+                loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * dist_entropy
+
+                if self.use_dynamic_beta:
+                    loss += self.beta * approx_kl
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -2158,11 +1637,10 @@ class Agent_GRPO:
 
         self.entropy = dist_entropy.item()
 
-    def get_state_dict(self):
-        return {'actor': self.actor.state_dict()}
+====================
+FILE: ./models/__init__.py
+====================
 
-    def load_state_dict(self, sd):
-        self.actor.load_state_dict(sd['actor'])
 
 ====================
 FILE: ./models/networks.py
@@ -2273,106 +1751,6 @@ class Rollout_Buffer:
         return len(self.memory)
 
 ====================
-FILE: ./__MACOSX/paper-code-main/._run_all_seeds.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/._custom_env.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/._test_model.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/._export_code.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/analysis/._analyze_convergence.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/analysis/._plot_learning_curves.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/config/._config.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/config/._grpo_config.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/experiments/._train_ppo_safe.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/experiments/._train_grpo.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/experiments/._train_dqn.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/experiments/._train_ppo.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/experiments/._train_grpo_static_beta.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._agent_ppo.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._agent_dqn.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._networks.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._replay_buffer.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/.___init__.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._agent_grpo.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xa5 in position 37: invalid start byte
-
-====================
-FILE: ./__MACOSX/paper-code-main/models/._agent_ppo_safe.py
-====================
-# Error reading file: 'utf-8' codec can't decode byte 0xac in position 45: invalid start byte
-
-====================
 FILE: ./envs/custom_merge_env.py
 ====================
 from logging import lastResort
@@ -2391,14 +1769,12 @@ from highway_env.vehicle.objects import Obstacle
 # ================== 关键坐标定义 ==================
 # 主路关键点
 X_MAIN_START = 0        # a点: 主路起点
-X_MERGE_START = 800     # b点: 汇入开始 (匝道接入点)
-X_MERGE_END = 1000      # c点: 汇入结束 (平行段结束)
-X_DESTINATION = 3000    # d点: 最终终点
-
+X_MERGE_START = 600    # b点: 汇入开始 (匝道接入点)
+X_MERGE_END = 700     # c点: 汇入结束 (平行段结束)
+X_DESTINATION = 1300    # d点: 最终终点
 # 匝道关键点
-X_RAMP_START = 500      # j点: 匝道起点
-LEN_RAMP_CURVE = 250    # S形弯道长度 (决定了切入的缓急)
-
+X_RAMP_START = 400     # j点: 匝道起点
+LEN_RAMP_CURVE = 50   # S形弯道长度 (决定了切入的缓急)
 # 匝道弯道起点 (k点)
 X_RAMP_CURVE_START = X_MERGE_START - LEN_RAMP_CURVE
 
@@ -2454,12 +1830,14 @@ class MergeEnv(AbstractEnv):
             "vehicles_count": 15,
             "initial_ego_speed": 20,
             "initial_traffic_speed": [20, 30],  # 随机生成这个速度范围的车辆
-            "duration": 60,
+            "duration": 25,
             "collision_reward": -50.0,
             "cooldown_steps": 3,                # 换道冷却时间
             "frequent_lc_reward": -10.0,        # 频繁换道惩罚
             "target_speed": 30.0,               # 目标速度
             "offroad_terminal": False,
+            #"simulation_frequency": 15,  # 物理仿真频率 (保持每秒15次)
+            #"policy_frequency": 5,  # 策略决策频率 (每秒做5次决策，相当于
 
             "scaling": 4.0,     # 渲染缩放
         })
@@ -2838,7 +2216,10 @@ class HighwayEnv(AbstractEnv):
             "duration": 40,
             "collision_reward": -20.0,
             "target_speed": 30.0,
-            "offroad_terminal": False
+            "offroad_terminal": False,
+            "simulation_frequency": 15,  # 物理仿真频率 (保持每秒15次)
+            "policy_frequency": 5,  # 策略决策频率 (每秒做5次决策，相当于
+
         })
         return config
 
