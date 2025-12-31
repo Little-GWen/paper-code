@@ -1,3 +1,4 @@
+
 import sys
 import os
 import argparse
@@ -20,11 +21,10 @@ from envs.custom_merge_env import MergeEnv
 gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-# ================= 自定义 Ray Worker (带环境注册 & NaN防护) =================
+# ================= 自定义 Ray Worker =================
 @ray.remote
 class RayWorker:
     def __init__(self, env_id, seed):
-        # 1. 重新注册环境 (防止 Ray Worker 找不到)
         import gymnasium as gym
         from envs.custom_merge_env import MergeEnv
         try:
@@ -40,8 +40,7 @@ class RayWorker:
         if terminated or truncated:
             obs, _ = self.env.reset()
 
-        # 2. 🛡️ 鲁棒性保护：NaN 清洗
-        # 如果环境返回 NaN，强制变为 0，防止 PPO 崩溃
+        # 🛡️ 鲁棒性保护：NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -49,27 +48,22 @@ class RayWorker:
 
     def reset(self):
         obs, _ = self.env.reset()
-
-        # 2. 🛡️ 鲁棒性保护：NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
         return obs
 
     def close(self):
         self.env.close()
 
 
-# ================= 自定义 Ray VecEnv (修复 SB3 兼容性) =================
+# ================= 自定义 Ray VecEnv =================
 class RayVecEnv(VecEnv):
     def __init__(self, env_id, num_envs, seed_start=0):
         ray.init(ignore_reinit_error=True)
         self.workers = [RayWorker.remote(env_id, seed_start + i) for i in range(num_envs)]
 
-        # 获取环境信息用于初始化
         dummy = gym.make(env_id)
 
-        # 3. 手动赋值属性 (跳过 super().__init__ 以避免 render_mode 报错)
         self.num_envs = num_envs
         self.observation_space = dummy.observation_space
         self.action_space = dummy.action_space
@@ -93,19 +87,14 @@ class RayVecEnv(VecEnv):
         ray.get([w.close.remote() for w in self.workers])
         ray.shutdown()
 
-    # SB3 必需的抽象方法实现
     def get_attr(self, attr_name, indices=None): return []
-
     def set_attr(self, attr_name, value, indices=None): pass
-
-    def env_method(self, method_name, *method_args, indices=None, **method_kwargs): return []
-
-    def env_is_wrapped(self, wrapper_class, indices=None): return [False] * self.num_envs
-
+    def env_method(self, method_name, *args, **kwargs): return []
+    def env_is_wrapped(self, wrapper, indices=None): return [False] * self.num_envs
     def seed(self, seed=None): return
 
 
-# ================= 回调函数 (增加 Episodes 显示) =================
+# ================= 回调函数 =================
 class MatchCallback(BaseCallback):
     def __init__(self, save_dir):
         super().__init__(verbose=0)
@@ -114,12 +103,9 @@ class MatchCallback(BaseCallback):
         self.log_spd = []
         self.log_col = []
 
-        # 临时 buffer
         self.ep_rew = np.zeros(NUM_PROCESSES)
         self.ep_spd = np.zeros(NUM_PROCESSES)
         self.ep_len = np.zeros(NUM_PROCESSES)
-
-        # 🆕 总回合计数器
         self.total_episodes = 0
 
     def _on_step(self) -> bool:
@@ -134,30 +120,23 @@ class MatchCallback(BaseCallback):
             self.ep_spd[i] += infos[i].get('speed', 0)
 
             if dones[i]:
-                # 🆕 计数 +1
                 self.total_episodes += 1
-
                 self.log_rew.append(self.ep_rew[i])
                 self.log_spd.append(self.ep_spd[i] / max(1, self.ep_len[i]))
                 self.log_col.append(1.0 if infos[i].get('crashed', False) else 0.0)
 
-                # 重置
                 self.ep_rew[i] = 0
                 self.ep_spd[i] = 0
                 self.ep_len[i] = 0
         return True
 
     def _on_rollout_end(self):
-        # 定期打印与保存
         if len(self.log_rew) > 0:
             avg_rew = np.mean(self.log_rew[-100:])
             col_rate = np.mean(self.log_col[-100:])
+            # 打印当前步数进度
+            print(f"   [PPO] Step: {self.num_timesteps}/{TOTAL_TRAIN_STEPS} | Ep: {self.total_episodes} | Rew: {avg_rew:.2f} | Col: {col_rate:.2f}")
 
-            # 🆕 打印 Episode 信息
-            print(
-                f"   [PPO] Episodes: {self.total_episodes} | Steps: {self.num_timesteps} | Mean Rew: {avg_rew:.2f} | Col: {col_rate:.2f}")
-
-            # 保存
             np.save(os.path.join(self.save_dir, 'rewards.npy'), self.log_rew)
             np.save(os.path.join(self.save_dir, 'speed.npy'), self.log_spd)
             np.save(os.path.join(self.save_dir, 'collision.npy'), self.log_col)
@@ -173,18 +152,9 @@ def main():
     save_dir = f'results/train/ppo/seed_{args.seed}'
     if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 初始化并行环境
     env = RayVecEnv(RAM_ENV_NAME, args.n_workers, seed_start=args.seed)
 
-    # 策略网络设置
     policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=dict(pi=[512, 512], vf=[512, 512]))
-
-    # === 关键参数调整 ===
-    # 目的：消除 UserWarning，并适配 Ray 的并行采样
-    # 假设 n_workers = 7 (你的配置)
-    # n_steps = 512 -> 总 Buffer = 512 * 7 = 3584 步
-    # batch_size = 1024 -> 3584 足够分成 3 个完整的 batch (剩一点丢弃)
-    # 这样既不会报错，也能保证训练稳定
 
     model = PPO(
         "MlpPolicy",
@@ -192,22 +162,21 @@ def main():
         verbose=1,
         device=DEVICE,
         policy_kwargs=policy_kwargs,
-
-        n_steps=512,  # 每个 Worker 采集步数 (调大一点，避免 Buffer 太小)
-        batch_size=1024,  # 每次更新使用的 Batch (1024 适合中等规模训练)
-        n_epochs=10,  # 每次更新循环 10 遍
+        n_steps=512,
+        batch_size=1024,
+        n_epochs=10,
         learning_rate=3e-4,
-        ent_coef=0.01  # 增加熵正则，鼓励探索
+        ent_coef=0.01
     )
 
-    print(f"🚀 PPO (Ray) Training Started | Workers: {args.n_workers}")
+    print(f"🚀 PPO (Ray) Training Started | Workers: {args.n_workers} | Target Steps: {TOTAL_TRAIN_STEPS}")
     try:
-        model.learn(total_timesteps=RAM_NUM_EPISODE * MAX_T, callback=MatchCallback(save_dir))
+        # 使用统一的总步数
+        model.learn(total_timesteps=TOTAL_TRAIN_STEPS, callback=MatchCallback(save_dir))
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
         env.close()
-        # 确保最后保存一次
         torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
 
 

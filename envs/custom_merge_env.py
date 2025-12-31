@@ -72,13 +72,13 @@ class MergeEnv(AbstractEnv):
             },
             "action": {"type": "DiscreteMetaAction"},
             "lanes_count": 2,
-            "vehicles_count": 15,
+            "vehicles_count": 20,
             "initial_ego_speed": 20,
             "initial_traffic_speed": [20, 30],  # 随机生成这个速度范围的车辆
             "duration": 25,
             "collision_reward": -50.0,
-            "cooldown_steps": 3,                # 换道冷却时间
-            "frequent_lc_reward": -10.0,        # 频繁换道惩罚
+            "cooldown_steps": 0,                # 换道冷却时间
+            "frequent_lc_reward": 0,        # 频繁换道惩罚
             "target_speed": 30.0,               # 目标速度
             "offroad_terminal": False,
             #"simulation_frequency": 15,  # 物理仿真频率 (保持每秒15次)

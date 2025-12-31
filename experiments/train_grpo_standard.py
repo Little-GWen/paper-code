@@ -1,6 +1,7 @@
+
 import sys, os, time, argparse, numpy as np, torch, gymnasium as gym, ray
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.grpo_config import *
 from models.agent_grpo_ray import Agent_GRPO_Ray
 from envs.custom_merge_env import MergeEnv
@@ -17,7 +18,6 @@ class GRPOWorker:
         try:
             gym.make(env_id)
         except gymnasium.error.NameNotFound:
-
             gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
         self.seed = seed + worker_id * 1000
         np.random.seed(self.seed);
@@ -85,10 +85,14 @@ def train():
     global_base, ema, step, ep, buffer = 0.0, 0.95, 0, 0, []
     logs = {'rew': [], 'spd': [], 'col': []}
 
-    print(f"🚀 GRPO (Standard) Ray Training Started")
+    last_save_step = 0
+    SAVE_FREQ = 100000
+
+    print(f"🚀 GRPO (Standard) Ray Training Started | Target Steps: {TOTAL_TRAIN_STEPS}")
 
     try:
-        while ep < RAM_NUM_EPISODE:
+        # 修改循环条件: 基于总步数
+        while step < TOTAL_TRAIN_STEPS:
             w_ref = ray.put(learner.get_weights())
             results = ray.get([w.sample.remote(w_ref, global_base, MAX_T) for w in workers])
 
@@ -107,12 +111,17 @@ def train():
             if len(buffer) >= BATCH_SIZE:
                 learner.learn(buffer, step)
                 buffer = []
-                print(f"Ep {ep} | Step {step} | Rew {np.mean(logs['rew'][-100:]):.1f}")
-                if (ep // GROUP_SIZE) % 50 == 0:
+                print(f"Step {step}/{TOTAL_TRAIN_STEPS} | Ep {ep} | Rew {np.mean(logs['rew'][-100:]):.1f}")
+
+                # 修改保存逻辑: 基于步数间隔
+                if step - last_save_step >= SAVE_FREQ:
+                    last_save_step = step
                     torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
                     for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
     finally:
         ray.shutdown()
+        torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
+        for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
 
 
 if __name__ == '__main__': train()

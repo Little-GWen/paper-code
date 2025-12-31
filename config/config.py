@@ -1,3 +1,4 @@
+
 import torch
 import numpy as np
 import random
@@ -10,19 +11,24 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 # 环境名
 RAM_ENV_NAME = 'my-merge-v0'
 
-# 训练时长
+# --- 训练时长控制 (Unified Training Steps) ---
+# 统一设定总步数，替代 Episode 控制
+# 3,000,000 步 ≈ 50,000 Episodes * 60 Steps
+TOTAL_TRAIN_STEPS = 3000000
+
+# 原有参数 (保留，但不再作为主循环控制)
 RAM_NUM_EPISODE = 50000
 MAX_T = 60
 
 # 训练参数
 NUM_PROCESSES = 30
 
-
-# --- 废弃参数 ---
+# --- PPO/DQN 参数 ---
 BATCH_SIZE = 1024
 LEARNING_RATE = 1e-4
 GAMMA = 0.985
-DECAY_MAX_STEP = RAM_NUM_EPISODE * 40   # 衰减参数（线性衰减）：训练回合数 * 每回合最大时间步
+# 衰减参数：对齐总步数
+DECAY_MAX_STEP = TOTAL_TRAIN_STEPS
 LAMDA = 0.95
 EPS_CLIP = 0.2
 K_EPOCHS = 10

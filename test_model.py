@@ -27,7 +27,7 @@ folder_map = {
 def parse_args():
     parser = argparse.ArgumentParser(description="模型测试脚本")
     parser.add_argument('--algo', type=str,
-                        default='grpo',
+                        default='ppo',
                         choices=['ppo', 'grpo', 'grpo_standard', 'dqn'],
                         help='选择算法: ppo, grpo, dqn')
     parser.add_argument('--seed', type=int, default=0, help='加载哪个种子的权重')
