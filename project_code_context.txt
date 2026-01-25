@@ -4,231 +4,163 @@ FILE: ./test_model.py
 ====================
 import sys
 import os
-
-# --- 路径修正：确保能导入根目录的模块 ---
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
-
+import numpy as np
+import torch
 import gymnasium as gym
-import time
-import argparse
-# from config.config import *
-from config.grpo_config import *
+import ray
 
-from envs.custom_highway_env import HighwayEnv
-from envs.custom_merge_env import MergeEnv
+# --- 1. 路径与环境初始化 ---
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# 导入你的配置
+from config.grpo_config import (
+    RAM_ENV_NAME, MAX_T, DEVICE, BATCH_SIZE, LEARNING_RATE,
+    DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS, ENTROPY_COEF
+)
 from models.agent_grpo_ray import Agent_GRPO_Ray
-from stable_baselines3 import PPO, DQN
+import envs.custom_merge_env
 
-folder_map = {
-    'ppo': 'ppo',
-    'grpo': 'grpo_main',
-    'grpo_standard': 'grpo_standard',
-    'dqn': 'dqn'
-}
+# 实验配置
+ALGORITHMS = ['grpo_16', 'grpo_32', 'grpo_64', 'grpo_128', 'ppo', 'dqn']
+SEEDS = [0, 1, 2]
+TOTAL_TEST_EPISODES = 10000
+NUM_CPUS_PER_TASK = 6  # 每个模型开启多少个并行进程
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="模型测试脚本")
-    parser.add_argument('--algo', type=str,
-                        default='grpo',
-                        choices=['ppo', 'grpo', 'grpo_standard', 'dqn'],
-                        help='选择算法: ppo, grpo, dqn')
-    parser.add_argument('--seed', type=int, default=0, help='加载哪个种子的权重')
-    parser.add_argument('--episodes', type=int, default=100, help='测试几轮')
-    parser.add_argument('--render', action='store_true', default=True, help='是否渲染画面 (默认开启)')
-    parser.add_argument('--no-render', action='store_false', dest='render', help='关闭画面渲染')
-    return parser.parse_args()
+TRAIN_DIR_BASE = 'results/train'
+TEST_DIR_BASE = 'results/test'
 
 
-def get_model_path(algo, seed):
-    folder = folder_map.get(algo, algo)
-    return os.path.join('results', 'train', folder, f'seed_{seed}', 'weights.pth')
+# --- 2. 分布式评估 Worker ---
+@ray.remote
+class EvalWorker:
+    def __init__(self, algo, weight_file, env_name):
+        # 每个进程独立导入环境
+        import envs.custom_merge_env
+        self.env = gym.make(env_name)
+        self.algo = algo
 
-def get_save_path(algo, seed):
-    folder = folder_map.get(algo, algo)
-    return os.path.join('results', 'test', folder, f'seed_{seed}')
+        state_dim = int(np.prod(self.env.observation_space.shape))
+        act_dim = self.env.action_space.n
+
+        # --- 精确复用你原始代码的加载逻辑 ---
+        try:
+            if 'grpo' in algo:
+                self.agent = Agent_GRPO_Ray(
+                    state_size=state_dim, action_size=act_dim,
+                    bs=BATCH_SIZE, lr=LEARNING_RATE, decay_max_step=DECAY_MAX_STEP,
+                    gamma=GAMMA, eps_clip=EPS_CLIP, K_epochs=K_EPOCHS,
+                    entropy_coef=ENTROPY_COEF, device='cpu', is_worker=False
+                )
+                checkpoint = torch.load(weight_file, map_location='cpu')
+                sd = checkpoint['actor'] if (isinstance(checkpoint, dict) and 'actor' in checkpoint) else checkpoint
+                self.agent.actor.load_state_dict(sd)
+                self.agent.actor.eval()
+
+            elif algo == 'ppo':
+                from stable_baselines3 import PPO
+                policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=dict(pi=[512, 512], vf=[512, 512]))
+                model = PPO("MlpPolicy", self.env, policy_kwargs=policy_kwargs, device='cpu')
+                model.policy.load_state_dict(torch.load(weight_file, map_location='cpu'))
+                self.agent = model
+
+            elif algo == 'dqn':
+                from stable_baselines3 import DQN
+                policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=[512, 512])
+                model = DQN("MlpPolicy", self.env, policy_kwargs=policy_kwargs, device='cpu')
+                model.policy.load_state_dict(torch.load(weight_file, map_location='cpu'))
+                self.agent = model
+        except Exception as e:
+            print(f"Worker Error loading {algo}: {e}")
+
+    def work(self, episodes):
+        rews, spds, cols = [], [], []
+        for _ in range(episodes):
+            state, _ = self.env.reset()
+            if isinstance(state, tuple): state = state[0]
+            state = np.nan_to_num(state, nan=0.0)
+
+            ep_rew, ep_spd_list, crashed = 0, [], False
+
+            for _ in range(MAX_T):
+                # 动作选择逻辑
+                if 'grpo' in self.algo:
+                    with torch.no_grad():
+                        action, _ = self.agent.act(state.flatten(), deterministic=True)
+                else:
+                    # SB3 预测
+                    action, _ = self.agent.predict(state, deterministic=True)
+                    action = action.item()
+
+                state, reward, term, trunc, info = self.env.step(action)
+                state = np.nan_to_num(state, nan=0.0)
+                ep_rew += reward
+
+                # 速度记录
+                spd = info.get('speed', 0)
+                if hasattr(self.env.unwrapped, 'vehicle'):
+                    spd = self.env.unwrapped.vehicle.speed
+                ep_spd_list.append(spd)
+
+                if term or trunc:
+                    if info.get('crashed') or (
+                            hasattr(self.env.unwrapped, 'vehicle') and self.env.unwrapped.vehicle.crashed):
+                        crashed = True
+                    break
+
+            rews.append(ep_rew)
+            spds.append(np.mean(ep_spd_list) if ep_spd_list else 0)
+            cols.append(1.0 if crashed else 0.0)
+        return rews, spds, cols
 
 
-# SB3 包装器
-class SB3_Wrapper:
-    """
-    这个类把 SB3 的 model.predict 包装成和你自定义 Agent 一样的 .act 接口
-    这样下面的 test 循环就不用改代码了
-    """
-    def __init__(self, model):
-        self.model = model
-
-    def act(self, state, deterministic=True):
-        # SB3 的 predict 返回 (action, _states)
-        # 这里的 state 已经是 numpy 数组了，可以直接传
-        action, _ = self.model.predict(state, deterministic=deterministic)
-
-        # 如果是离散动作，action 是一个标量，直接返回即可
-        # 这里的 None 是为了模仿你自定义 Agent 返回的 (action, log_prob) 格式
-        return action.item(), None
-
-def test(env, agent, episodes, max_t, render, save_dir):
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
-
-    print(f"\n🚗 开始测试: {episodes} 轮 | 渲染: {render}")
-    print(f"📂 结果将保存至: {save_dir}")
-
-    # 初始化日志容器
-    log_rewards = []
-    log_avg_speeds = []
-    log_collisions = []  # 0: 安全, 1: 碰撞
-
-    for i in range(episodes):
-        state = env.reset()
-        if isinstance(state, tuple): state = state[0]
-        # state = state.flatten()
-
-        ep_reward = 0
-        ep_speed = []
-        done = False
-        t = 0
-        is_crashed = False
-
-        print(f"\n--- Episode {i + 1} Start ---")
-
-        while not done and t < max_t:
-            t += 1
-
-            # --- 核心适配逻辑 ---
-            # 如果是 GRPO，手动在这里 flatten 一下传进去
-            # 如果是 PPO/DQN (SB3_Wrapper)，直接传 (10, 6)
-            if isinstance(agent, Agent_GRPO_Ray):
-                state = state.flatten()
-
-            # 开启确定性模式
-            action, _ = agent.act(state, deterministic=True)
-
-            step_result = env.step(action)
-            next_state, reward, terminated, truncated, info = step_result
-            done = terminated or truncated
-            ep_reward += reward
-
-            # 记录速度（未归一化）
-            if hasattr(env.unwrapped, 'vehicle'):
-                ep_speed.append(env.unwrapped.vehicle.speed)
-            elif 'speed' in info:
-                ep_speed.append(info['speed'])
-
-            if done:
-                is_crashed = info.get('crashed', False)
-                # 双重保险检查
-                if hasattr(env.unwrapped, 'vehicle') and hasattr(env.unwrapped.vehicle, 'crashed'):
-                    if env.unwrapped.vehicle.crashed: is_crashed = True
-
-                end_reason = "💥 CRASHED" if is_crashed else "⏱️ TIME LIMIT"
-                print(f"   -> Terminated at Step {t} | Reason: {end_reason}")
-
-            state = next_state.copy()
-
-            # --- 渲染逻辑增强 ---
-            if render:
-                try:
-                    env.render()  # 新版尝试
-                except:
-                    try:
-                        env.render(mode='human')  # 旧版尝试
-                    except Exception as e:
-                        pass  # 忽略渲染错误，保证程序不崩
-                time.sleep(0.03)
-
-        avg_speed = np.mean(ep_speed) if ep_speed else 0
-        max_speed = np.max(ep_speed) if ep_speed else 0
-
-        log_rewards.append(ep_reward)
-        log_avg_speeds.append(avg_speed)
-        log_collisions.append(1.0 if is_crashed else 0.0)
-
-        print(f"   Episode {i + 1} Reward: {ep_reward:.2f} | Avg Speed: {avg_speed:.2f} m/s | Max Speed: {max_speed:.2f} m/s")
-
-    # 保存原始数据
-    np.save(os.path.join(save_dir, 'rewards.npy'), log_rewards)
-    np.save(os.path.join(save_dir, 'speed.npy'), log_avg_speeds)
-    np.save(os.path.join(save_dir, 'collision.npy'), log_collisions)
-    print(f"✅ 所有测试数据已保存至: {save_dir}")
-
+# --- 3. 主调度程序 ---
 def main():
-    args = parse_args()
+    ray.init(ignore_reinit_error=True)
+    print(f"🚀 分布式批量评估启动 | 目标环境: {RAM_ENV_NAME}")
 
-    # 环境初始化
-    render_mode = 'human' if args.render else None
-    try:
-        env = gym.make(RAM_ENV_NAME, render_mode=render_mode)
-    except:
-        env = gym.make(RAM_ENV_NAME)
-        if args.render and hasattr(env.unwrapped, 'config'):
-            env.unwrapped.config['render_mode'] = 'human'
+    for algo in ALGORITHMS:
+        for seed in SEEDS:
+            source_path = os.path.join(TRAIN_DIR_BASE, algo, f"seed_{seed}")
+            weight_file = os.path.join(source_path, 'weights.pth')
+            target_path = os.path.join(TEST_DIR_BASE, algo, f"seed_{seed}")
 
-    # 自动获取维度
-    state_dim = int(np.prod(env.observation_space.shape))
-    act_dim = env.action_space.n
+            if not os.path.exists(weight_file):
+                print(f"⏩ 缺失权重，跳过: {algo} seed {seed}")
+                continue
 
-    print(f"🔍 Environment: {RAM_ENV_NAME}")
-    print(f"🔍 State Dim: {state_dim}, Action Dim: {act_dim}")
-    print(f"🔍 Algorithm: {args.algo.upper()}")
+            if os.path.exists(os.path.join(target_path, 'rewards.npy')):
+                print(f"✅ 已存在结果，跳过: {algo} seed {seed}")
+                continue
 
-    model_path = get_model_path(args.algo, args.seed)           # 加载权重
-    save_dir   = get_save_path(args.algo, args.seed)            # 保存路径
+            print(f"▶️  并行测试中: [{algo}] Seed {seed}...")
+            os.makedirs(target_path, exist_ok=True)
 
-    # 加载模型
-    if args.algo in ['grpo', 'grpo_standard']:
-        agent = Agent_GRPO_Ray(state_dim, act_dim, BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA,
-                           EPS_CLIP, K_EPOCHS, ENTROPY_COEF, DEVICE)
-        if os.path.exists(model_path):
-            print(f"📂 Loading GRPO weights from: {model_path}")
-            checkpoint = torch.load(model_path, map_location=DEVICE)
-            if isinstance(checkpoint, dict) and 'actor' in checkpoint:
-                agent.actor.load_state_dict(checkpoint['actor'])
-            else:
-                agent.actor.load_state_dict(checkpoint)
-        else:
-            print(f"❌ File not found: {model_path}")
+            # 分配任务到多个并行 Worker
+            eps_per_worker = TOTAL_TEST_EPISODES // NUM_CPUS_PER_TASK
+            workers = [EvalWorker.remote(algo, weight_file, RAM_ENV_NAME) for _ in range(NUM_CPUS_PER_TASK)]
 
-    elif args.algo == 'ppo':
-        # 必须和训练时的 policy_kwargs 一模一样
-        policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=dict(pi=[512, 512], vf=[512, 512]))
-        sb3_model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, device=DEVICE)
-        if os.path.exists(model_path):
-            print(f"📂 Loading PPO weights from: {model_path}")
-            # 注意：加载到 model.policy 中
-            sb3_model.policy.load_state_dict(torch.load(model_path, map_location=DEVICE))
-            print("✅ Weights loaded successfully!")
-        else:
-            print(f"❌ File not found: {model_path}, 使用随机权重测试!")
+            # 并行执行
+            results = ray.get([w.work.remote(eps_per_worker) for w in workers])
 
-        # 包装成通用接口
-        agent = SB3_Wrapper(sb3_model)
+            # 汇总结果
+            all_r, all_s, all_c = [], [], []
+            for r, s, c in results:
+                all_r.extend(r);
+                all_s.extend(s);
+                all_c.extend(c)
 
-    elif args.algo == 'dqn':
-        policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=[512, 512])
-        sb3_model = DQN("MlpPolicy", env, policy_kwargs=policy_kwargs, device=DEVICE)
-        if os.path.exists(model_path):
-            print(f"📂 Loading DQN weights from: {model_path}")
-            sb3_model.policy.load_state_dict(torch.load(model_path, map_location=DEVICE))
-            print("✅ Weights loaded successfully!")
-        else:
-            print(f"❌ File not found: {model_path}, 使用随机权重测试!")
-        agent = SB3_Wrapper(sb3_model)
+            # 保存
+            np.save(os.path.join(target_path, 'rewards.npy'), np.array(all_r))
+            np.save(os.path.join(target_path, 'speed.npy'), np.array(all_s))
+            np.save(os.path.join(target_path, 'collision.npy'), np.array(all_c))
 
-    else:
-        raise ValueError(f"Unknown algorithm: {args.algo}")
+            print(f"    📊 Avg Reward: {np.mean(all_r):.2f} | Crash Rate: {np.mean(all_c) * 100:.1f}%")
 
-    # 开始测试
-    try:
-        test(env, agent, args.episodes, MAX_T, args.render, save_dir)
-    except KeyboardInterrupt:
-        print("\n🛑 Test interrupted by user.")
-    finally:
-        env.close()
-        print("Done.")
+    ray.shutdown()
+    print("🎉 所有并行评估已完成！")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 ====================
@@ -268,6 +200,236 @@ if __name__ == "__main__":
     merge_files()
 
 ====================
+FILE: ./memory_test.py
+====================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import gc
+import sys
+
+# ================= 配置区域 =================
+OUTPUT_DIR = 'analysis/memory_plots'  # 图片和数据保存路径
+CSV_NAME = 'memory_benchmark_data.csv'
+
+# 1. 实验一：测试 Batch Size 扩展性 (固定模型大小)
+# 测试范围：从 2^8 (256) 到 2^20 (100万+)，直到跑崩
+BATCH_SIZES = [2 ** i for i in range(8, 21)]
+FIXED_HIDDEN_FOR_BS = 256
+
+# 2. 实验二：测试模型参数量扩展性 (固定 Batch Size)
+# 测试范围：隐藏层从 64 到 16384
+HIDDEN_DIMS = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
+FIXED_BS_FOR_MODEL = 2048
+
+# 绘图风格设置 (SCI 论文风格)
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman'],
+    'axes.unicode_minus': False,
+    'figure.figsize': (10, 6),
+    'font.size': 12,
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'lines.linewidth': 2.5,
+    'lines.markersize': 8
+})
+
+# 颜色定义：GRPO用显眼的绿色，PPO用橙色，DQN用蓝色
+PALETTE = {'GRPO': '#2ca02c', 'PPO': '#ff7f0e', 'DQN': '#1f77b4'}
+MARKERS = {'GRPO': '^', 'PPO': 'o', 'DQN': 's'}
+
+# 设备检测
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# ================= 模拟网络结构 =================
+class SimpleNet(nn.Module):
+    """模拟策略网络或价值网络 (3层 MLP)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ================= 核心测试函数 =================
+def run_single_test(algo, batch_size, hidden_dim):
+    """运行一次显存测量，返回峰值显存 (MB)"""
+    # 1. 清理环境
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    gc.collect()
+
+    try:
+        input_dim = 60
+        action_dim = 5
+        # 模拟输入数据
+        x = torch.randn(batch_size, input_dim).to(DEVICE)
+
+        # 2. 根据算法构建不同的计算图
+        # 注意：这里模拟的是训练步骤，包含前向+反向+优化器状态
+
+        if algo == 'PPO':
+            # PPO: Actor + Critic + 两个优化器
+            actor = SimpleNet(input_dim, hidden_dim, action_dim).to(DEVICE)
+            critic = SimpleNet(input_dim, hidden_dim, 1).to(DEVICE)
+
+            opt_actor = optim.Adam(actor.parameters(), lr=1e-4)
+            opt_critic = optim.Adam(critic.parameters(), lr=1e-4)
+
+            # Forward & Backward
+            loss = actor(x).sum() + critic(x).sum()
+            loss.backward()
+            opt_actor.step()
+            opt_critic.step()
+
+        elif algo == 'DQN':
+            # DQN: Q-Network + Target Network + 一个优化器
+            # Target Network 不求导，但占显存
+            q_net = SimpleNet(input_dim, hidden_dim, action_dim).to(DEVICE)
+            target_net = SimpleNet(input_dim, hidden_dim, action_dim).to(DEVICE)
+
+            opt = optim.Adam(q_net.parameters(), lr=1e-4)
+
+            # Forward & Backward
+            loss = q_net(x).sum()
+            loss.backward()
+            opt.step()
+
+            # 模拟 Target Net 的存在
+            with torch.no_grad():
+                _ = target_net(x)
+
+        elif algo == 'GRPO':
+            # GRPO: 只有 Actor + 一个优化器 (无 Critic)
+            # 这是省显存的关键原因
+            actor = SimpleNet(input_dim, hidden_dim, action_dim).to(DEVICE)
+            opt = optim.Adam(actor.parameters(), lr=1e-4)
+
+            # Forward & Backward
+            loss = actor(x).sum()
+            loss.backward()
+            opt.step()
+
+        # 3. 获取显存峰值
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / 1024 / 1024  # MB
+        else:
+            peak_mem = 0  # CPU不测
+
+        return peak_mem
+
+    except RuntimeError as e:
+        if 'out of memory' in str(e):
+            return None  # 标记为 OOM
+        else:
+            raise e
+
+
+# ================= 主流程：测试与绘图 =================
+def main():
+    if not torch.cuda.is_available():
+        print("⚠️ 警告: 未检测到 GPU，显存测试可能无效或报错！")
+
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    results = []
+
+    print("🚀 开始全自动显存基准测试...")
+    print(f"📌 结果将保存至: {OUTPUT_DIR}")
+
+    # --- 阶段 1: Batch Size 扩展性 ---
+    print("\n[1/2] Testing Batch Size Scalability...")
+    for algo in ['PPO', 'DQN', 'GRPO']:
+        print(f"  > Testing {algo} ... ", end="", flush=True)
+        for bs in BATCH_SIZES:
+            mem = run_single_test(algo, bs, FIXED_HIDDEN_FOR_BS)
+            if mem is not None:
+                results.append({'Type': 'Batch', 'Algo': algo, 'X': bs, 'Memory': mem})
+            else:
+                print(f"OOM at Batch={bs}", end="")
+                break  # 一旦 OOM，后面的更大的肯定也过不去，跳过以节省时间
+        print(" Done.")
+
+    # --- 阶段 2: Model Size 扩展性 ---
+    print("\n[2/2] Testing Model Parameter Scalability...")
+    for algo in ['PPO', 'DQN', 'GRPO']:
+        print(f"  > Testing {algo} ... ", end="", flush=True)
+        for hd in HIDDEN_DIMS:
+            mem = run_single_test(algo, FIXED_BS_FOR_MODEL, hd)
+            if mem is not None:
+                results.append({'Type': 'Model', 'Algo': algo, 'X': hd, 'Memory': mem})
+            else:
+                print(f"OOM at Hidden={hd}", end="")
+                break
+        print(" Done.")
+
+    # --- 保存数据 ---
+    df = pd.DataFrame(results)
+    df.to_csv(os.path.join(OUTPUT_DIR, CSV_NAME), index=False)
+    print("\n💾 数据已保存。开始绘图...")
+
+    # ================= 绘图逻辑 =================
+
+    # 图 1: Batch Size (对数坐标)
+    plt.figure()
+    df_batch = df[df['Type'] == 'Batch']
+
+    # 绘制曲线
+    sns.lineplot(data=df_batch, x='X', y='Memory', hue='Algo', style='Algo',
+                 palette=PALETTE, markers=MARKERS, dashes=False)
+
+    plt.xscale('log', base=2)  # X轴使用 Log2
+    plt.xlabel('Batch Size (Log Scale)', fontsize=14)
+    plt.ylabel('Peak GPU Memory (MB)', fontsize=14)
+    plt.title('Memory Efficiency vs. Batch Size', fontsize=16, fontweight='bold', pad=12)
+    plt.legend(title='Algorithm', loc='upper left', frameon=True, framealpha=0.9)
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+
+    save_path1 = os.path.join(OUTPUT_DIR, 'memory_batch_scaling.png')
+    plt.tight_layout()
+    plt.savefig(save_path1, dpi=300)
+    print(f"📊 图 1 已保存: {save_path1}")
+
+    # 图 2: Model Size (线性坐标)
+    plt.figure()
+    df_model = df[df['Type'] == 'Model']
+
+    sns.lineplot(data=df_model, x='X', y='Memory', hue='Algo', style='Algo',
+                 palette=PALETTE, markers=MARKERS, dashes=False)
+
+    plt.xlabel('Model Hidden Dimension', fontsize=14)
+    plt.ylabel('Peak GPU Memory (MB)', fontsize=14)
+    plt.title('Memory Scalability vs. Model Size', fontsize=16, fontweight='bold', pad=12)
+    plt.legend(title='Algorithm', loc='upper left', frameon=True, framealpha=0.9)
+
+    save_path2 = os.path.join(OUTPUT_DIR, 'memory_model_scaling.png')
+    plt.tight_layout()
+    plt.savefig(save_path2, dpi=300)
+    print(f"📊 图 2 已保存: {save_path2}")
+
+    print("\n✅ 全部完成！可以将图片直接插入论文了。")
+
+
+if __name__ == "__main__":
+    main()
+
+====================
 FILE: ./run_all_seeds.py
 ====================
 
@@ -286,7 +448,7 @@ SEEDS = [0,1,2]
 
 ALGORITHMS = [
     # 1. GRPO 主模型 (Ours)
-    ("experiments/train_grpo.py", "GRPO (Ours)"),
+    #("experiments/train_grpo.py", "GRPO (Ours)"),
 
     # 2. PPO 基线 (Baseline)
     ("experiments/train_ppo.py", "PPO (Baseline)"),
@@ -340,6 +502,7 @@ if __name__ == "__main__":
 ====================
 FILE: ./analysis/plot_learning_curves.py
 ====================
+
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -347,47 +510,52 @@ import pandas as pd
 import seaborn as sns
 
 # ================= 1. 路径与核心配置 =================
-# 注意：请确保脚本在项目目录下运行，或者手动修改 RESULTS_DIR 为绝对路径
 RESULTS_DIR = '../results'
 SAVE_DIR = '../analysis'
-SAMPLE_RATE = 50  # 每50个点取1个，防止画图太慢
+SAMPLE_RATE = 100  # 采样率：每100个点取1个，数据点多了，采样可以稀疏一点
 
-# 算法配置：根据你的反馈，GRPO 是 reward.npy (单数)
+# ⚠️ 关键设置：这必须和你训练时的 TOTAL_TRAIN_STEPS 一致
+TOTAL_TRAIN_STEPS = 5000000
+
 experiments_config = {
     'GRPO (Ours)': {
         'folder': 'grpo_main',
-        'step_scale': 32,
         'color': '#1f77b4',
-        'reward_fn': 'reward.npy'  # 修正为单数
+        'reward_fn': 'rewards.npy'  # GRPO 保存的是 rewards.npy
     },
     'PPO (Baseline)': {
         'folder': 'ppo',
-        'step_scale': 1,
         'color': '#ff7f0e',
-        'reward_fn': 'rewards.npy'  # 修正为复数
+        'reward_fn': 'rewards.npy'
     },
     'DQN (Baseline)': {
         'folder': 'dqn',
-        'step_scale': 1,
         'color': '#d62728',
+        'reward_fn': 'rewards.npy'
+    },
+    # 如果有 Standard 对比
+    'GRPO (Standard)': {
+        'folder': 'grpo_128',
+        'color': '#2ca02c',
         'reward_fn': 'rewards.npy'
     },
 }
 
-# 设置论文级字体 (修复了之前导致报错的 dpi 问题)
+# 论文级绘图风格
 plt.rcParams.update({
     'font.family': 'serif',
     'font.serif': ['Times New Roman'],
     'axes.unicode_minus': False,
-    'figure.figsize': (10, 6)
+    'figure.figsize': (10, 6),
+    'axes.grid': True,
+    'grid.alpha': 0.3
 })
 
 
-# ================= 2. 数据处理引擎 =================
+# ================= 2. 数据处理引擎 (自动对齐 X 轴) =================
 
 def load_algorithm_data(label, config, metric_type):
     folder = config['folder']
-    scale = config['step_scale']
     rew_file = config['reward_fn']
 
     path = os.path.join(RESULTS_DIR, 'train', folder)
@@ -402,41 +570,65 @@ def load_algorithm_data(label, config, metric_type):
 
     for seed in seed_folders:
         sp = os.path.join(path, seed)
-
         try:
-            # 根据不同指标选择加载的文件
+            # --- 1. 读取数据 ---
             if metric_type == 'reward':
                 target_path = os.path.join(sp, rew_file)
+                if not os.path.exists(target_path): continue
                 data = np.load(target_path)
+
             elif metric_type == 'safety':
-                # 优先找 collision.npy，找不到则用 reward 阈值推断
-                col_path = os.path.join(sp, 'collision.npy')
+                col_path = os.path.join(sp, 'collision.npy')  # 优先找 collision
                 if os.path.exists(col_path):
-                    data = 1.0 - np.load(col_path)
+                    # collision: 1=撞, 0=安全 -> safety: 0=撞, 1=安全
+                    # 也可以做滑动平均安全率
+                    raw_col = np.load(col_path)
+                    data = 1.0 - raw_col
                 else:
-                    rew = np.load(os.path.join(sp, rew_file))
-                    data = (rew > -45.0).astype(float)
+                    # 找不到 collision 文件则跳过
+                    continue
+
             elif metric_type == 'speed':
                 speed_path = os.path.join(sp, 'speed.npy')
-                data = np.load(speed_path) * 40  # 还原 km/h
+                if not os.path.exists(speed_path): continue
+                # 假设环境归一化了，这里简单还原 (视你的环境而定)
+                # 如果你的 speed.npy 已经是真实速度，就不需要 * 40
+                data = np.load(speed_path)  # * 40
 
-            # 平滑处理
-            v_smooth = pd.Series(data).rolling(window=100, min_periods=1).mean().values
-            # 下采样
-            v_down = v_smooth[::SAMPLE_RATE]
-            # 横轴对齐 (Episode * Scale = Total Steps)
-            steps = (np.arange(len(v_smooth)) * scale)[::SAMPLE_RATE]
+            else:
+                return None
+
+            # --- 2. 数据平滑 ---
+            # 窗口大小根据数据量动态调整，保证曲线平滑
+            # PPO 数据点多，窗口大一点；GRPO 数据点少，窗口小一点
+            win_size = max(int(len(data) * 0.01), 10)
+            v_smooth = pd.Series(data).rolling(window=win_size, min_periods=1).mean().values
+
+            # --- 3. 下采样 (防止画图太卡) ---
+            # 我们不需要画几十万个点，只需要画几千个点
+            target_plot_points = 1000
+            if len(v_smooth) > target_plot_points:
+                indices = np.linspace(0, len(v_smooth) - 1, target_plot_points).astype(int)
+                v_down = v_smooth[indices]
+            else:
+                v_down = v_smooth
+
+            # --- 4. 关键修正：X 轴强行拉伸对齐 ---
+            # 无论原来有多少个点，我们都认为最后一个点对应 TOTAL_TRAIN_STEPS
+            steps = np.linspace(0, TOTAL_TRAIN_STEPS, len(v_down))
 
             all_dfs.append(pd.DataFrame({'Steps': steps, 'Value': v_down, 'Algorithm': label}))
+
         except Exception as e:
+            print(f"Error {seed}: {e}")
             continue
 
     if not all_dfs:
-        print("未找到有效数据。")
+        print("无数据。")
         return None
 
     df_final = pd.concat(all_dfs, ignore_index=True)
-    print(f"成功! (最大步数: {df_final['Steps'].max()})")
+    print(f"成功! (Samples: {len(df_final)})")
     return df_final
 
 
@@ -446,244 +638,487 @@ def run_plot(metric_type, title, ylabel, filename):
     plt.figure()
     sns.set_style("whitegrid", {'grid.linestyle': '--'})
 
+    # 调色板
+    palette = {k: v['color'] for k, v in experiments_config.items()}
+
     plot_data = []
     for label, config in experiments_config.items():
         df = load_algorithm_data(label, config, metric_type)
         if df is not None:
             plot_data.append(df)
 
-    if not plot_data: return
+    if not plot_data:
+        print(f"⚠️ {metric_type} 没有数据可画")
+        return
 
     final_df = pd.concat(plot_data, ignore_index=True)
 
-    # 绘制
+    # 绘制带置信区间的曲线
     sns.lineplot(
         data=final_df, x='Steps', y='Value', hue='Algorithm',
-        palette={k: v['color'] for k, v in experiments_config.items() if k in final_df['Algorithm'].unique()},
-        linewidth=2.5, errorbar='sd', alpha=0.9
+        palette=palette, linewidth=2.0, errorbar='sd', alpha=0.8
     )
 
-    plt.title(title, fontweight='bold', fontsize=16, pad=20)
-    plt.xlabel("Total Environment Samples", fontsize=14)
-    plt.ylabel(ylabel, fontsize=14)
+    plt.title(title, fontweight='bold', fontsize=14, pad=15)
+    plt.xlabel("Total Environment Steps", fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+
+    # 科学计数法显示 X 轴
     plt.ticklabel_format(style='sci', axis='x', scilimits=(0, 0))
 
-    # 强制 X 轴从 0 开始，撑满最大值
-    plt.xlim(0, final_df['Steps'].max() * 1.05)
+    # 设置 X 轴范围
+    plt.xlim(0, TOTAL_TRAIN_STEPS)
 
+    plt.legend(loc='lower right', frameon=True, framealpha=0.9)
     plt.tight_layout()
-    if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
 
-    # 在 savefig 时指定 dpi，避免 rcParams 报错
+    if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
     save_path = os.path.join(SAVE_DIR, filename)
     plt.savefig(save_path, dpi=300)
-    print(f"🎉 图片已成功保存至: {save_path}\n")
+    print(f"🎉 图片已保存: {save_path}\n")
     plt.close()
 
 
 if __name__ == "__main__":
-    print("🚀 开始绘制训练分析图...\n")
-    # 1. 奖励
-    run_plot('reward', 'Training Convergence Comparison', 'Average Return', 'train_reward.png')
-    # 2. 安全率
-    run_plot('safety', 'Training Safety Performance', 'Survival Rate', 'train_safety.png')
-    # 3. 速度
-    run_plot('speed', 'Driving Efficiency', 'Speed (km/h)', 'train_speed.png')
+    print(f"🚀 开始绘图 (Target Steps: {TOTAL_TRAIN_STEPS})...\n")
+
+    # 1. 奖励曲线
+    run_plot('reward', 'Training Reward Convergence', 'Average Reward', 'train_reward.png')
+
+    # 2. 安全率曲线 (Survival Rate)
+    # 这里的 safety 是 0~1 的值
+    run_plot('safety', 'Safety Rate during Training', 'Safety Rate (0-1)', 'train_safety.png')
+
+    # 3. 速度曲线
+    run_plot('speed', 'Average Speed during Training', 'Speed', 'train_speed.png')
 
 ====================
 FILE: ./analysis/plot_test_curves.py
+====================
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+
+# ================= 配置 =================
+# 测试结果的根目录
+TEST_RESULT_DIR = '../results/test'
+# 图片/表格保存目录
+OUTPUT_DIR = '../analysis/report'
+
+# 想要统计的指标文件名
+METRICS_FILES = {
+    'Reward': 'rewards.npy',
+    'Speed': 'speed.npy',
+    'Collision': 'collision.npy'
+}
+
+# 绘图风格
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman'],
+    'axes.unicode_minus': False,
+    'figure.figsize': (12, 6),
+    'font.size': 12
+})
+
+
+def get_algo_display_name(folder_name):
+    """美化算法名称用于显示"""
+    name = folder_name.replace('_', ' ').upper()
+    # 特殊处理 GRPO 的 Group Size 显示
+    if 'GRPO' in name:
+        # 尝试提取数字
+        match = re.search(r'(\d+)', name)
+        if match:
+            return f"GRPO (G={match.group(1)})"
+        if 'MAIN' in name:
+            return "GRPO (Main)"
+        if 'STANDARD' in name:
+            return "GRPO (Standard)"
+    return name
+
+
+def load_and_aggregate():
+    """核心数据加载逻辑"""
+    if not os.path.exists(TEST_RESULT_DIR):
+        print(f"❌ 目录不存在: {TEST_RESULT_DIR}")
+        return []
+
+    summary_data = []
+    raw_data_list = []
+
+    # 1. 遍历算法文件夹
+    algo_folders = sorted(os.listdir(TEST_RESULT_DIR))
+
+    for algo_folder in algo_folders:
+        algo_path = os.path.join(TEST_RESULT_DIR, algo_folder)
+        if not os.path.isdir(algo_path): continue
+
+        display_name = get_algo_display_name(algo_folder)
+
+        # 临时存储该算法所有种子的均值
+        seed_means = {'Reward': [], 'Speed': [], 'Success Rate': []}
+
+        # 2. 遍历种子文件夹
+        seeds = [s for s in os.listdir(algo_path) if s.startswith('seed_')]
+
+        for seed in seeds:
+            seed_path = os.path.join(algo_path, seed)
+
+            try:
+                # 读取 Reward
+                rew = np.load(os.path.join(seed_path, METRICS_FILES['Reward']))
+                # 读取 Speed
+                spd = np.load(os.path.join(seed_path, METRICS_FILES['Speed']))
+                # 读取 Collision
+                col = np.load(os.path.join(seed_path, METRICS_FILES['Collision']))
+
+                # --- 计算单一种子的统计值 ---
+                # 成功率 = (1 - 碰撞率) * 100
+                success_rate = (1.0 - np.mean(col)) * 100
+                avg_rew = np.mean(rew)
+                avg_spd = np.mean(spd)
+
+                # 存入列表用于计算算法总均值
+                seed_means['Reward'].append(avg_rew)
+                seed_means['Speed'].append(avg_spd)
+                seed_means['Success Rate'].append(success_rate)
+
+                # 存入原始数据用于画图 (Seaborn 会自动算误差)
+                # 假设每个种子测了 N 轮，我们把 N 轮的均值作为一个数据点
+                # 或者如果你想画箱线图，可以存入每一轮的数据
+                raw_data_list.append({
+                    'Algorithm': display_name,
+                    'Reward': avg_rew,
+                    'Speed': avg_spd,
+                    'Success Rate': success_rate,
+                    'Seed': seed
+                })
+
+            except Exception as e:
+                print(f"⚠️  跳过 {algo_folder}/{seed}: 文件缺失或损坏 ({e})")
+                continue
+
+        # --- 计算该算法所有种子的聚合统计 (Mean ± Std) ---
+        if seed_means['Reward']:
+            n = len(seed_means['Reward'])
+            entry = {'Algorithm': display_name, 'Seeds': n}
+
+            for metric in ['Reward', 'Speed', 'Success Rate']:
+                m = np.mean(seed_means[metric])
+                s = np.std(seed_means[metric])
+                entry[f'{metric} Mean'] = m
+                entry[f'{metric} Std'] = s
+                # 格式化字符串用于表格展示
+                entry[metric] = f"{m:.2f} ± {s:.2f}"
+
+            summary_data.append(entry)
+
+    return pd.DataFrame(summary_data), pd.DataFrame(raw_data_list)
+
+
+def plot_bar_charts(raw_df):
+    """绘制带误差线的柱状图"""
+    if raw_df.empty: return
+
+    metrics = ['Reward', 'Success Rate', 'Speed']
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # 定义颜色调色板
+    palette = sns.color_palette("muted")
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+
+        # 使用 Barplot，Seaborn 会自动计算置信区间或标准差
+        sns.barplot(
+            data=raw_df,
+            x='Algorithm',
+            y=metric,
+            ax=ax,
+            palette=palette,
+            capsize=.1,
+            errorbar='sd'  # 显示标准差
+        )
+
+        ax.set_title(f"Average {metric}", fontweight='bold', fontsize=14)
+        ax.set_xlabel("")
+        ax.tick_params(axis='x', rotation=45)
+        ax.grid(axis='y', linestyle='--', alpha=0.5)
+
+        # 特殊处理：成功率上限设为 100+
+        if metric == 'Success Rate':
+            ax.set_ylim(0, 105)
+            ax.set_ylabel("Success Rate (%)")
+        elif metric == 'Speed':
+            ax.set_ylabel("Speed (m/s)")
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'benchmark_comparison.png')
+    plt.savefig(save_path, dpi=300)
+    print(f"📊 图表已保存: {save_path}")
+
+
+def main():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    print("🔄 正在扫描并计算测试结果...")
+
+    # 1. 获取数据
+    summary_df, raw_df = load_and_aggregate()
+
+    if summary_df.empty:
+        print("❌ 未找到有效数据，请确保已经运行了 run_batch_test.py")
+        return
+
+    # 2. 整理表格 (按名称排序，让 GRPO 排在一起)
+    # 简单的排序逻辑：先把名称排序
+    summary_df.sort_values('Algorithm', inplace=True)
+
+    # 提取用于显示的列
+    display_table = summary_df[['Algorithm', 'Reward', 'Success Rate', 'Speed', 'Seeds']]
+
+    # 3. 输出 Markdown 表格到控制台
+    print("\n" + "=" * 80)
+    print("🏆 FINAL TEST RESULTS SUMMARY (Mean ± Std over Seeds)")
+    print("=" * 80)
+    print(display_table.to_markdown(index=False))
+    print("=" * 80)
+
+    # 4. 保存 CSV
+    csv_path = os.path.join(OUTPUT_DIR, 'test_statistics.csv')
+    display_table.to_csv(csv_path, index=False)
+    print(f"💾 表格已保存: {csv_path}")
+
+    # 5. 绘图
+    plot_bar_charts(raw_df)
+
+
+if __name__ == "__main__":
+    main()
+
+====================
+FILE: ./analysis/grpo_ablation_experiment.py
 ====================
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pandas as pd
 import seaborn as sns
+import re
 
-RESULTS_DIR = '../results'
-SAVE_DIR = '../analysis'
+# ================= 1. 配置参数 =================
+RESULTS_DIR = '../results/train'  # 数据根目录
+SAVE_DIR = '../analysis/ablation'  # 图片保存目录
+TOTAL_TRAIN_STEPS = 5000000  # 你的统一训练步数
+SAMPLE_RATE = 100  # 下采样率，防止点太多画图卡顿
 
-# 定义实验配置
-experiments_config = {
-    # GRPO 的GROUP_SIZE 是 32
-    'GRPO (Ours)': {'folder': 'grpo_main', 'step_scale': 1, 'color': '#1f77b4'},
-    'PPO (Baseline)': {'folder': 'ppo', 'step_scale': 1, 'color': '#ff7f0e'},
-    'DQN (Baseline)': {'folder': 'dqn', 'step_scale': 1, 'color': '#d62728'},
-    'GRPO (Static-Beta)': {'folder': 'ppo_static_beta', 'step_scale': 1, 'color': '#2ca03d'},
-    'GRPO (Standard)': {'folder': 'grpo_standard', 'step_scale': 1, 'color': '#2ca02c'},
+# 绘图风格设置
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman'],
+    'axes.unicode_minus': False,
+    'figure.figsize': (8, 5),
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'font.size': 12
+})
+
+# 定义颜色 (不同 Group Size 使用渐变色或对比色)
+# 如果你有更多组，可以继续添加
+PALETTE = {
+    16: '#8c564b',  # 棕色
+    32: '#1f77b4',  # 蓝色 (基准)
+    64: '#ff7f0e',  # 橙色
+    96: '#9467bd',  # 紫色
+    128: '#2ca02c',  # 绿色
+    256: '#d62728'  # 红色
 }
 
 
-def load_data_robust(label, config, metric_type):
-    folder = config['folder']
-    step_scale = config['step_scale']
-    path = os.path.join(RESULTS_DIR, 'test', folder)
+# ================= 2. 数据加载逻辑 =================
 
-    # 检查文件夹是否存在，不存在则跳过而不报错
-    if not os.path.exists(path):
+def load_ablation_data(metric_type):
+    """
+    扫描文件夹，加载不同 Group Size 的数据
+    metric_type: 'reward', 'safety', 'speed'
+    """
+    if not os.path.exists(RESULTS_DIR):
+        print(f"❌ 路径不存在: {RESULTS_DIR}")
         return None
 
     all_dfs = []
-    # 读取所有 seed_ 开头的文件夹
-    seed_folders = [d for d in os.listdir(path) if d.startswith('seed_')]
 
-    for seed_folder in seed_folders:
-        try:
-            reward_path = os.path.join(path, seed_folder, 'rewards.npy')
-            collision_path = os.path.join(path, seed_folder, 'collision.npy')
-            speed_path = os.path.join(path, seed_folder, 'speed.npy')
+    # 遍历 results/train 下的所有文件夹
+    for folder_name in os.listdir(RESULTS_DIR):
+        # 1. 正则匹配：查找类似 grpo_16, grpo_32, G32, GroupSize64 等命名
+        # 只要文件夹名字里包含数字，且包含 grpo，我们就认为它是消融实验对象
+        if not ('grpo' in folder_name.lower()):
+            continue
 
-            # 处理速度数据
-            if metric_type == 'speed':
-                if os.path.exists(speed_path):
-                    data = np.load(speed_path)
+        # 提取数字部分作为 Group Size
+        match = re.search(r'(\d+)', folder_name)
+        if not match:
+            continue
 
-                    # 反归一化，还原真实速度
-                    # data *= 40
+        group_size = int(match.group(1))
+        algo_label = f"G={group_size}"  # 图例显示的名称
 
-                    # 平滑处理
-                    data_smooth = pd.Series(data).rolling(window=50, min_periods=1).mean().values
-                    steps = np.arange(len(data_smooth)) * step_scale
-                    all_dfs.append(pd.DataFrame({'Episode': steps, 'Value': data_smooth, 'Algorithm': label}))
+        folder_path = os.path.join(RESULTS_DIR, folder_name)
+        seed_folders = [d for d in os.listdir(folder_path) if d.startswith('seed_')]
+
+        print(f"处理 Group Size: {group_size} ({len(seed_folders)} seeds)...")
+
+        for seed in seed_folders:
+            seed_path = os.path.join(folder_path, seed)
+
+            try:
+                # --- 根据类型读取不同文件 ---
+                # 兼容 GRPO (rew.npy) 和 PPO (rewards.npy) 的命名习惯
+                if metric_type == 'reward':
+                    if os.path.exists(os.path.join(seed_path, 'rew.npy')):
+                        data = np.load(os.path.join(seed_path, 'rew.npy'))
+                    elif os.path.exists(os.path.join(seed_path, 'rewards.npy')):
+                        data = np.load(os.path.join(seed_path, 'rewards.npy'))
+                    else:
+                        continue
+
+                elif metric_type == 'safety':
+                    # 读取 collision (0/1)，转为 safety (1/0)
+                    if os.path.exists(os.path.join(seed_path, 'col.npy')):
+                        col_data = np.load(os.path.join(seed_path, 'col.npy'))
+                    elif os.path.exists(os.path.join(seed_path, 'collision.npy')):
+                        col_data = np.load(os.path.join(seed_path, 'collision.npy'))
+                    else:
+                        continue
+                    # 平滑一下再算安全率，视觉效果更好
+                    data = 1.0 - col_data
+
+                elif metric_type == 'speed':
+                    if os.path.exists(os.path.join(seed_path, 'spd.npy')):
+                        data = np.load(os.path.join(seed_path, 'spd.npy'))
+                    elif os.path.exists(os.path.join(seed_path, 'speed.npy')):
+                        data = np.load(os.path.join(seed_path, 'speed.npy'))
+                    else:
+                        continue
+
+                else:
+                    continue
+
+                # --- 数据对齐与平滑 ---
+                # 1. 简单平滑 (Rolling Mean)
+                win_size = max(int(len(data) * 0.02), 5)  # 动态窗口
+                data_smooth = pd.Series(data).rolling(window=win_size, min_periods=1).mean().values
+
+                # 2. 下采样 (Downsampling)
+                # 无论原始数据多少个点，都插值到 1000 个点，方便画图
+                target_points = 1000
+                indices = np.linspace(0, len(data_smooth) - 1, target_points).astype(int)
+                data_down = data_smooth[indices]
+
+                # 3. 生成 X 轴 (Environment Steps)
+                steps = np.linspace(0, TOTAL_TRAIN_STEPS, target_points)
+
+                all_dfs.append(pd.DataFrame({
+                    'Steps': steps,
+                    'Value': data_down,
+                    'Group Size': group_size,  # 用于排序和颜色映射
+                    'Label': algo_label
+                }))
+
+            except Exception as e:
+                print(f"  ⚠️ 读取错误 {seed_path}: {e}")
                 continue
 
-            # 处理奖励与碰撞
-            if not os.path.exists(reward_path): continue
-            rewards = np.load(reward_path)
-            collisions = None
-            if os.path.exists(collision_path):
-                try:
-                    loaded = np.load(collision_path)
-                    if len(loaded) > 0: collisions = loaded
-                except:
-                    pass
-            # 如果没有 collision 文件，尝试从 reward 推断 (后备方案)
-            if collisions is None:
-                collisions = np.where(rewards < -50.0, 1.0, 0.0)  # 修正判定阈值
-            # 对齐数据长度
-            min_len = min(len(rewards), len(collisions))
-            rewards = rewards[:min_len]
-            collisions = collisions[:min_len]
+    if not all_dfs:
+        return None
 
-            win_size = 100
-
-            # 根据指标类型计算数据
-            if metric_type == 'safety_rate':
-                final_data = 1.0 - collisions  # 0=Crash -> 1=Safe
-                win_size = 150
-
-            elif metric_type == 'weighted_reward':
-                is_safe = 1.0 - collisions
-                final_data = rewards * is_safe
-
-            elif metric_type == 'reward':
-                final_data = rewards
-
-            # 平滑处理
-            data_smooth = pd.Series(final_data).rolling(window=win_size, min_periods=1).mean().values
-            steps = np.arange(len(data_smooth)) * step_scale
-
-            all_dfs.append(pd.DataFrame({
-                'Episode': steps,
-                'Value': data_smooth,
-                'Algorithm': label
-            }))
-
-        except Exception as e:
-            print(f"⚠️ 跳过 {seed_folder}: {e}")
-
-    return pd.concat(all_dfs, ignore_index=True) if all_dfs else None
+    return pd.concat(all_dfs, ignore_index=True)
 
 
-def plot_paper_graph(metric_type, title, ylabel, filename, y_limit=None):
-    plt.figure(figsize=(8, 5))
-    # 设置 Seaborn 风格
-    sns.set_theme(style="whitegrid", font_scale=1.1)
+# ================= 3. 绘图函数 =================
 
-    all_data = []
-    # 遍历配置加载数据
-    for label, config in experiments_config.items():
-        df = load_data_robust(label, config, metric_type)
-        if df is not None:
-            all_data.append(df)
-
-    if not all_data:
-        print(f"❌ 无法绘制 {metric_type}")
+def plot_metric(metric_type, title, ylabel, filename):
+    df = load_ablation_data(metric_type)
+    if df is None:
+        print(f"⚠️ {metric_type} 没有找到有效数据，跳过。")
         return
 
-    final_df = pd.concat(all_data, ignore_index=True)
+    plt.figure()
+    sns.set_style("whitegrid", {'grid.linestyle': '--'})
 
-    # 动态生成颜色调色板，只包含存在的算法
-    unique_algos = final_df['Algorithm'].unique()
-    palette = {k: v['color'] for k, v in experiments_config.items() if k in unique_algos}
+    # 获取存在的 Group Size 并排序
+    unique_groups = sorted(df['Group Size'].unique())
+
+    # 动态生成颜色板 (如果在 PALETTE 里有定义就用定义的，没有就用 Seaborn 默认)
+    custom_palette = {}
+    for g in unique_groups:
+        custom_palette[f"G={g}"] = PALETTE.get(g, None)  # None 会让 sns 自动分配
 
     # 绘图
     sns.lineplot(
-        data=final_df, x='Episode', y='Value', hue='Algorithm',
-        palette=palette, linewidth=2.5, alpha=0.9
+        data=df, x='Steps', y='Value', hue='Label',
+        # 按照 Group Size 数字大小排序图例
+        hue_order=[f"G={g}" for g in unique_groups],
+        palette=custom_palette,
+        linewidth=2.5, errorbar='sd', alpha=0.85
     )
 
-    plt.title(title, fontsize=14, fontweight='bold', pad=12)
-    plt.xlabel("Training Episodes (Equivalent)", fontsize=12)
+    plt.title(title, fontweight='bold', fontsize=14, pad=15)
+    plt.xlabel("Total Environment Steps", fontsize=12)
     plt.ylabel(ylabel, fontsize=12)
 
-    if y_limit:
-        plt.ylim(y_limit)
+    # X轴科学计数法
+    plt.ticklabel_format(style='sci', axis='x', scilimits=(0, 0))
+    plt.xlim(0, TOTAL_TRAIN_STEPS)
 
-    # 优化图例
-    plt.legend(frameon=True, fancybox=True, framealpha=0.9, fontsize=10, loc='best')
-    plt.grid(True, linestyle='--', alpha=0.6)
+    # 图例优化
+    plt.legend(title="Group Size", loc='best', frameon=True, framealpha=0.9, fancybox=True)
     plt.tight_layout()
 
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
-    plt.savefig(os.path.join(SAVE_DIR, filename), dpi=300, bbox_inches='tight')
-    print(f"✅ Saved: {filename}")
+
+    save_path = os.path.join(SAVE_DIR, filename)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"🎉 图片保存成功: {save_path}")
+    plt.close()
 
 
 if __name__ == "__main__":
-    print("🎨 Generating Plots...")
-    # 1. 安全率对比
-    plot_paper_graph('safety_rate', 'Safety Performance (Survival Rate)', 'Safety Rate', 'test_safety.png', (0.0, 1.05))
-    # 2. 有效奖励对比 (撞车=0分)
-    plot_paper_graph('weighted_reward', 'Effective Performance', 'Reward (Zero on Crash)', 'test_effective.png')
-    # 3. 速度对比
-    plot_paper_graph('speed', 'Driving Efficiency', 'Speed (km/h)', 'test_speed.png')
-    # 4. 原始奖励对比
-    plot_paper_graph('reward', 'Raw Training Reward', 'Average Reward', 'test_raw_reward.png')
+    print(f"🚀 开始绘制消融实验图表 (Group Size Ablation)...")
+    print(f"📂 扫描目录: {RESULTS_DIR}")
+    print("-" * 60)
 
-====================
-FILE: ./analysis/analyze_convergence.py
-====================
-import numpy as np
-import os
+    # 1. 奖励曲线
+    plot_metric('reward',
+                'Effect of Group Size on Average Reward',
+                'Average Reward',
+                'ablation_reward.png')
 
-DATA_DIR = '../results'
+    # 2. 安全率曲线
+    plot_metric('safety',
+                'Effect of Group Size on Safety Rate',
+                'Safety Rate (0-1)',
+                'ablation_safety.png')
 
+    # 3. 速度曲线
+    plot_metric('speed',
+                'Effect of Group Size on Driving Efficiency',
+                'Average Speed',
+                'ablation_speed.png')
 
-def analyze(algo_folder, name):
-    path = os.path.join(DATA_DIR, algo_folder)
-    if not os.path.exists(path): return
-    scores = []
-    for seed in os.listdir(path):
-        if seed.startswith('seed_'):
-            f = os.path.join(path, seed, 'rewards.npy')
-            if os.path.exists(f):
-                data = np.load(f)
-                scores.append(np.mean(data[-500:]))
-
-    if scores:
-        print(f"--- {name} ---")
-        print(f"Final Reward (Mean ± Std): {np.mean(scores):.2f} ± {np.std(scores):.2f}")
-
-
-if __name__ == "__main__":
-    analyze('ppo', 'PPO')
-    analyze('grpo_main', 'GRPO')
-    analyze('grpo_no_dynamic', 'GRPO (Ablation)')
+    print("-" * 60)
+    print("✅ 所有绘图任务完成！请查看 results/analysis/ablation 文件夹。")
 
 ====================
 FILE: ./config/config.py
 ====================
+
 import torch
 import numpy as np
 import random
@@ -696,19 +1131,24 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 # 环境名
 RAM_ENV_NAME = 'my-merge-v0'
 
-# 训练时长
+# --- 训练时长控制 (Unified Training Steps) ---
+# 统一设定总步数，替代 Episode 控制
+# 3,000,000 步 ≈ 50,000 Episodes * 60 Steps
+TOTAL_TRAIN_STEPS = 5000000
+
+# 原有参数 (保留，但不再作为主循环控制)
 RAM_NUM_EPISODE = 50000
-MAX_T = 60
+MAX_T = 50
 
 # 训练参数
 NUM_PROCESSES = 30
 
-
-# --- 废弃参数 ---
-BATCH_SIZE = 1024
+# --- PPO/DQN 参数 ---
+BATCH_SIZE = 8192
 LEARNING_RATE = 1e-4
 GAMMA = 0.985
-DECAY_MAX_STEP = RAM_NUM_EPISODE * 40   # 衰减参数（线性衰减）：训练回合数 * 每回合最大时间步
+# 衰减参数：对齐总步数
+DECAY_MAX_STEP = TOTAL_TRAIN_STEPS
 LAMDA = 0.95
 EPS_CLIP = 0.2
 K_EPOCHS = 10
@@ -740,25 +1180,28 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 # 环境名
 RAM_ENV_NAME = 'my-merge-v0'
 
-# 训练时长
+# --- 训练时长控制 (Unified Training Steps) ---
+TOTAL_TRAIN_STEPS = 5000000  # 3M steps
+
+# 原有参数
 RAM_NUM_EPISODE = 80000
-MAX_T = 60
+MAX_T = 50
 
 # 训练参数
-NUM_PROCESSES =30
+NUM_PROCESSES = 30
 BATCH_SIZE = 8192       # 采集 8192 步训练一次
 MINI_BATCH_SIZE = 512   # 与 8192 采集量配合
 LEARNING_RATE = 3e-4
 GAMMA = 0.99            # GRPO中，0.99 是底线，不要降低它
 
-# 衰减参数（线性衰减）
-DECAY_MAX_STEP = RAM_NUM_EPISODE * MAX_T
+# 衰减参数（线性衰减）：训练总步数
+DECAY_MAX_STEP = TOTAL_TRAIN_STEPS
 
 # GRPO 特有参数
-EPS_CLIP = 0.1          # 0.2 -> 0.1 配合强力的 Tiered Advantage 信号，防止策略更新过猛导致震荡
+EPS_CLIP = 0.1          # 0.2 -> 0.1 配合强力的 Tiered Advantage 信号
 K_EPOCHS = 10
-ENTROPY_COEF = 0.001    # 必须比 PPO 更低，否则它不敢确定策略
-GROUP_SIZE = 32
+ENTROPY_COEF = 0.001    # 必须比 PPO 更低
+GROUP_SIZE = 128
 
 # --- 全局随机种子设置函数 ---
 def set_seed(seed):
@@ -773,6 +1216,7 @@ def set_seed(seed):
 ====================
 FILE: ./experiments/train_dqn.py
 ====================
+
 import sys
 import os
 import argparse
@@ -783,7 +1227,6 @@ import torch
 import gymnasium as gym
 import ray
 
-# 添加项目根目录
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from stable_baselines3 import DQN
@@ -793,11 +1236,9 @@ from stable_baselines3.common.callbacks import BaseCallback
 from config.config import *
 from envs.custom_merge_env import MergeEnv
 
-# 主进程注册环境
 gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-# ================= 自定义 Ray Worker (同 PPO) =================
 @ray.remote
 class RayWorker:
     def __init__(self, env_id, seed):
@@ -816,7 +1257,6 @@ class RayWorker:
         if terminated or truncated:
             obs, _ = self.env.reset()
 
-        # 🛡️ NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -824,7 +1264,6 @@ class RayWorker:
 
     def reset(self):
         obs, _ = self.env.reset()
-        # 🛡️ NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
         return obs
@@ -833,20 +1272,16 @@ class RayWorker:
         self.env.close()
 
 
-# ================= 自定义 Ray VecEnv (同 PPO) =================
 class RayVecEnv(VecEnv):
     def __init__(self, env_id, num_envs, seed_start=0):
         ray.init(ignore_reinit_error=True)
         self.workers = [RayWorker.remote(env_id, seed_start + i) for i in range(num_envs)]
-
         dummy = gym.make(env_id)
-
         self.num_envs = num_envs
         self.observation_space = dummy.observation_space
         self.action_space = dummy.action_space
         self.render_mode = getattr(dummy, "render_mode", None)
         self.metadata = getattr(dummy, "metadata", {"render_modes": []})
-
         dummy.close()
 
     def step_async(self, actions):
@@ -865,17 +1300,12 @@ class RayVecEnv(VecEnv):
         ray.shutdown()
 
     def get_attr(self, attr_name, indices=None): return []
-
     def set_attr(self, attr_name, value, indices=None): pass
-
     def env_method(self, method_name, *args, **kwargs): return []
-
     def env_is_wrapped(self, wrapper, indices=None): return [False] * self.num_envs
-
     def seed(self, seed=None): return
 
 
-# ================= 回调函数 =================
 class MatchCallback(BaseCallback):
     def __init__(self, save_dir):
         super().__init__(verbose=0)
@@ -883,7 +1313,6 @@ class MatchCallback(BaseCallback):
         self.log_rew = []
         self.log_spd = []
         self.log_col = []
-
         self.ep_rew = np.zeros(NUM_PROCESSES)
         self.ep_spd = np.zeros(NUM_PROCESSES)
         self.ep_len = np.zeros(NUM_PROCESSES)
@@ -898,24 +1327,21 @@ class MatchCallback(BaseCallback):
 
         for i in range(len(infos)):
             self.ep_spd[i] += infos[i].get('speed', 0)
-
             if dones[i]:
                 self.log_rew.append(self.ep_rew[i])
                 self.log_spd.append(self.ep_spd[i] / max(1, self.ep_len[i]))
                 self.log_col.append(1.0 if infos[i].get('crashed', False) else 0.0)
-
                 self.ep_rew[i] = 0
                 self.ep_spd[i] = 0
                 self.ep_len[i] = 0
 
-        # DQN 可以在 step 中定期保存
         if self.num_timesteps % 5000 == 0:
             self._save_logs()
         return True
 
     def _save_logs(self):
         if len(self.log_rew) > 0:
-            print(f"   [DQN] Steps: {self.num_timesteps} | Mean Rew: {np.mean(self.log_rew[-100:]):.2f}")
+            print(f"   [DQN] Steps: {self.num_timesteps}/{TOTAL_TRAIN_STEPS} | Mean Rew: {np.mean(self.log_rew[-100:]):.2f}")
             np.save(os.path.join(self.save_dir, 'rewards.npy'), self.log_rew)
             np.save(os.path.join(self.save_dir, 'speed.npy'), self.log_spd)
             np.save(os.path.join(self.save_dir, 'collision.npy'), self.log_col)
@@ -931,13 +1357,9 @@ def main():
     save_dir = f'results/train/dqn/seed_{args.seed}'
     if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 初始化并行环境
     env = RayVecEnv(RAM_ENV_NAME, args.n_workers, seed_start=args.seed)
-
     policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=[512, 512])
 
-    # 初始化 DQN
-    # DQN 比较吃内存，buffer_size 设为 50000 比较安全
     model = DQN(
         "MlpPolicy",
         env,
@@ -949,9 +1371,10 @@ def main():
         batch_size=256
     )
 
-    print(f"🚀 DQN (Ray) Training Started | Workers: {args.n_workers}")
+    print(f"🚀 DQN (Ray) Training Started | Workers: {args.n_workers} | Target Steps: {TOTAL_TRAIN_STEPS}")
     try:
-        model.learn(total_timesteps=RAM_NUM_EPISODE * MAX_T, callback=MatchCallback(save_dir))
+        # 使用统一的总步数
+        model.learn(total_timesteps=TOTAL_TRAIN_STEPS, callback=MatchCallback(save_dir))
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
@@ -965,6 +1388,7 @@ if __name__ == '__main__':
 ====================
 FILE: ./experiments/train_ppo.py
 ====================
+
 import sys
 import os
 import argparse
@@ -987,11 +1411,10 @@ from envs.custom_merge_env import MergeEnv
 gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
 
 
-# ================= 自定义 Ray Worker (带环境注册 & NaN防护) =================
+# ================= 自定义 Ray Worker =================
 @ray.remote
 class RayWorker:
     def __init__(self, env_id, seed):
-        # 1. 重新注册环境 (防止 Ray Worker 找不到)
         import gymnasium as gym
         from envs.custom_merge_env import MergeEnv
         try:
@@ -1007,8 +1430,7 @@ class RayWorker:
         if terminated or truncated:
             obs, _ = self.env.reset()
 
-        # 2. 🛡️ 鲁棒性保护：NaN 清洗
-        # 如果环境返回 NaN，强制变为 0，防止 PPO 崩溃
+        # 🛡️ 鲁棒性保护：NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -1016,27 +1438,22 @@ class RayWorker:
 
     def reset(self):
         obs, _ = self.env.reset()
-
-        # 2. 🛡️ 鲁棒性保护：NaN 清洗
         if np.isnan(obs).any() or np.isinf(obs).any():
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
         return obs
 
     def close(self):
         self.env.close()
 
 
-# ================= 自定义 Ray VecEnv (修复 SB3 兼容性) =================
+# ================= 自定义 Ray VecEnv =================
 class RayVecEnv(VecEnv):
     def __init__(self, env_id, num_envs, seed_start=0):
         ray.init(ignore_reinit_error=True)
         self.workers = [RayWorker.remote(env_id, seed_start + i) for i in range(num_envs)]
 
-        # 获取环境信息用于初始化
         dummy = gym.make(env_id)
 
-        # 3. 手动赋值属性 (跳过 super().__init__ 以避免 render_mode 报错)
         self.num_envs = num_envs
         self.observation_space = dummy.observation_space
         self.action_space = dummy.action_space
@@ -1060,19 +1477,14 @@ class RayVecEnv(VecEnv):
         ray.get([w.close.remote() for w in self.workers])
         ray.shutdown()
 
-    # SB3 必需的抽象方法实现
     def get_attr(self, attr_name, indices=None): return []
-
     def set_attr(self, attr_name, value, indices=None): pass
-
-    def env_method(self, method_name, *method_args, indices=None, **method_kwargs): return []
-
-    def env_is_wrapped(self, wrapper_class, indices=None): return [False] * self.num_envs
-
+    def env_method(self, method_name, *args, **kwargs): return []
+    def env_is_wrapped(self, wrapper, indices=None): return [False] * self.num_envs
     def seed(self, seed=None): return
 
 
-# ================= 回调函数 (增加 Episodes 显示) =================
+# ================= 回调函数 =================
 class MatchCallback(BaseCallback):
     def __init__(self, save_dir):
         super().__init__(verbose=0)
@@ -1081,12 +1493,9 @@ class MatchCallback(BaseCallback):
         self.log_spd = []
         self.log_col = []
 
-        # 临时 buffer
         self.ep_rew = np.zeros(NUM_PROCESSES)
         self.ep_spd = np.zeros(NUM_PROCESSES)
         self.ep_len = np.zeros(NUM_PROCESSES)
-
-        # 🆕 总回合计数器
         self.total_episodes = 0
 
     def _on_step(self) -> bool:
@@ -1101,30 +1510,23 @@ class MatchCallback(BaseCallback):
             self.ep_spd[i] += infos[i].get('speed', 0)
 
             if dones[i]:
-                # 🆕 计数 +1
                 self.total_episodes += 1
-
                 self.log_rew.append(self.ep_rew[i])
                 self.log_spd.append(self.ep_spd[i] / max(1, self.ep_len[i]))
                 self.log_col.append(1.0 if infos[i].get('crashed', False) else 0.0)
 
-                # 重置
                 self.ep_rew[i] = 0
                 self.ep_spd[i] = 0
                 self.ep_len[i] = 0
         return True
 
     def _on_rollout_end(self):
-        # 定期打印与保存
         if len(self.log_rew) > 0:
             avg_rew = np.mean(self.log_rew[-100:])
             col_rate = np.mean(self.log_col[-100:])
+            # 打印当前步数进度
+            print(f"   [PPO] Step: {self.num_timesteps}/{TOTAL_TRAIN_STEPS} | Ep: {self.total_episodes} | Rew: {avg_rew:.2f} | Col: {col_rate:.2f}")
 
-            # 🆕 打印 Episode 信息
-            print(
-                f"   [PPO] Episodes: {self.total_episodes} | Steps: {self.num_timesteps} | Mean Rew: {avg_rew:.2f} | Col: {col_rate:.2f}")
-
-            # 保存
             np.save(os.path.join(self.save_dir, 'rewards.npy'), self.log_rew)
             np.save(os.path.join(self.save_dir, 'speed.npy'), self.log_spd)
             np.save(os.path.join(self.save_dir, 'collision.npy'), self.log_col)
@@ -1140,18 +1542,9 @@ def main():
     save_dir = f'results/train/ppo/seed_{args.seed}'
     if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    # 初始化并行环境
     env = RayVecEnv(RAM_ENV_NAME, args.n_workers, seed_start=args.seed)
 
-    # 策略网络设置
     policy_kwargs = dict(activation_fn=torch.nn.ReLU, net_arch=dict(pi=[512, 512], vf=[512, 512]))
-
-    # === 关键参数调整 ===
-    # 目的：消除 UserWarning，并适配 Ray 的并行采样
-    # 假设 n_workers = 7 (你的配置)
-    # n_steps = 512 -> 总 Buffer = 512 * 7 = 3584 步
-    # batch_size = 1024 -> 3584 足够分成 3 个完整的 batch (剩一点丢弃)
-    # 这样既不会报错，也能保证训练稳定
 
     model = PPO(
         "MlpPolicy",
@@ -1159,22 +1552,21 @@ def main():
         verbose=1,
         device=DEVICE,
         policy_kwargs=policy_kwargs,
-
-        n_steps=512,  # 每个 Worker 采集步数 (调大一点，避免 Buffer 太小)
-        batch_size=1024,  # 每次更新使用的 Batch (1024 适合中等规模训练)
-        n_epochs=10,  # 每次更新循环 10 遍
+        n_steps=512,
+        batch_size=1024,
+        n_epochs=10,
         learning_rate=3e-4,
-        ent_coef=0.01  # 增加熵正则，鼓励探索
+        ent_coef=0.01
     )
 
-    print(f"🚀 PPO (Ray) Training Started | Workers: {args.n_workers}")
+    print(f"🚀 PPO (Ray) Training Started | Workers: {args.n_workers} | Target Steps: {TOTAL_TRAIN_STEPS}")
     try:
-        model.learn(total_timesteps=RAM_NUM_EPISODE * MAX_T, callback=MatchCallback(save_dir))
+        # 使用统一的总步数
+        model.learn(total_timesteps=TOTAL_TRAIN_STEPS, callback=MatchCallback(save_dir))
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
         env.close()
-        # 确保最后保存一次
         torch.save(model.policy.state_dict(), os.path.join(save_dir, 'weights.pth'))
 
 
@@ -1182,143 +1574,12 @@ if __name__ == '__main__':
     main()
 
 ====================
-FILE: ./experiments/train_grpo.py
-====================
-import sys, os, time, argparse, numpy as np, torch, gymnasium as gym, ray
-
-import gymnasium
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from config.grpo_config import *
-from models.agent_grpo_ray import Agent_GRPO_Ray
-from envs.custom_merge_env import MergeEnv
-
-# 注册环境
-gym.register(id='my-merge-v0', entry_point='envs.custom_merge_env:MergeEnv')
-
-
-@ray.remote
-class GRPOWorker:
-    def __init__(self, env_id, seed, worker_id, adv_mode="tiered"):
-        import gymnasium as gym
-        from envs.custom_merge_env import MergeEnv
-        try:
-            gym.make(env_id)
-        except gymnasium.error.NameNotFound:
-            gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
-        self.seed = seed + worker_id * 1000
-        np.random.seed(self.seed);
-        torch.manual_seed(self.seed)
-        self.env = gym.make(env_id)
-        # Worker 只负责推理，device='cpu' 通常更快且省显存
-        self.agent = Agent_GRPO_Ray(
-            int(np.prod(self.env.observation_space.shape)), self.env.action_space.n,
-            BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
-            ENTROPY_COEF, torch.device('cpu'), is_worker=True, adv_mode=adv_mode
-        )
-
-    def sample(self, weights, baseline, max_t):
-        self.agent.set_weights(weights)
-        group_trajs, metrics = [], {'rew': [], 'spd': [], 'col': []}
-        total_steps = 0
-
-        # 组采样
-        group_seed = np.random.randint(0, 1e6)
-        for _ in range(GROUP_SIZE):
-            s, _ = self.env.reset(seed=group_seed);
-            s = s.flatten()
-            traj = []
-            ep_r, ep_s = 0, []
-            for _ in range(max_t):
-                with torch.no_grad():
-                    a, lp = self.agent.act(torch.FloatTensor(s))
-                ns, r, term, trunc, info = self.env.step(a);
-                ns = ns.flatten()
-                traj.append((s, a, r, ns, term, lp))
-                ep_r += r;
-                ep_s.append(info.get('speed', 0));
-                s = ns
-                if term or trunc: break
-
-            group_trajs.append(traj)
-            total_steps += len(traj)
-            metrics['rew'].append(ep_r)
-            metrics['spd'].append(np.mean(ep_s) if ep_s else 0)
-            metrics['col'].append(1 if info.get('crashed') else 0)
-
-        # 计算优势
-        advs, avg_rew, grp_mean = self.agent.calculate_group_advantages(group_trajs, baseline)
-
-        # 组装 Batch
-        batch = []
-        for tr, adv in zip(group_trajs, advs):
-            for step in tr: batch.append((step[0], step[1], adv, step[3], step[4], step[5]))
-
-        return batch, metrics, grp_mean, total_steps
-
-
-def train():
-    parser = argparse.ArgumentParser();
-    parser.add_argument('--seed', type=int, default=0)
-    args = parser.parse_args()
-
-    ray.init()
-    save_dir = f'results/train/grpo_main/seed_{args.seed}'
-    os.makedirs(save_dir, exist_ok=True)
-
-    dummy = gym.make(RAM_ENV_NAME)
-    learner = Agent_GRPO_Ray(
-        int(np.prod(dummy.observation_space.shape)), dummy.action_space.n,
-        BATCH_SIZE, LEARNING_RATE, DECAY_MAX_STEP, GAMMA, EPS_CLIP, K_EPOCHS,
-        ENTROPY_COEF, DEVICE, is_worker=False, adv_mode="tiered", use_dynamic_beta=True
-    )
-
-    workers = [GRPOWorker.remote(RAM_ENV_NAME, args.seed, i, "tiered") for i in range(NUM_PROCESSES)]
-
-    global_base, ema = 0.0, 0.95
-    step, ep = 0, 0
-    buffer, logs = [], {'rew': [], 'spd': [], 'col': []}
-
-    print(f"🚀 GRPO (Main) Ray Training Started | Workers: {NUM_PROCESSES}")
-
-    try:
-        while ep < RAM_NUM_EPISODE:
-            w_ref = ray.put(learner.get_weights())
-            results = ray.get([w.sample.remote(w_ref, global_base, MAX_T) for w in workers])
-
-            grp_means = []
-            for batch, m, gm, s in results:
-                buffer.extend(batch)
-                logs['rew'].extend(m['rew']);
-                logs['spd'].extend(m['spd']);
-                logs['col'].extend(m['col'])
-                grp_means.append(gm)
-                ep += GROUP_SIZE;
-                step += s
-
-            global_base = np.mean(grp_means) if global_base == 0 else ema * global_base + (1 - ema) * np.mean(grp_means)
-
-            if len(buffer) >= BATCH_SIZE:
-                learner.learn(buffer, step)
-                buffer = []
-                print(f"Ep {ep} | Step {step} | Rew {np.mean(logs['rew'][-100:]):.1f} | Base {global_base:.1f}")
-
-                if (ep // GROUP_SIZE) % 50 == 0:  # 稍微减少保存频率
-                    torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
-                    for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
-
-    finally:
-        ray.shutdown()
-
-
-if __name__ == '__main__': train()
-
-====================
 FILE: ./experiments/train_grpo_standard.py
 ====================
+
 import sys, os, time, argparse, numpy as np, torch, gymnasium as gym, ray
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.grpo_config import *
 from models.agent_grpo_ray import Agent_GRPO_Ray
 from envs.custom_merge_env import MergeEnv
@@ -1335,7 +1596,6 @@ class GRPOWorker:
         try:
             gym.make(env_id)
         except gymnasium.error.NameNotFound:
-
             gym.register(id=env_id, entry_point='envs.custom_merge_env:MergeEnv')
         self.seed = seed + worker_id * 1000
         np.random.seed(self.seed);
@@ -1403,10 +1663,14 @@ def train():
     global_base, ema, step, ep, buffer = 0.0, 0.95, 0, 0, []
     logs = {'rew': [], 'spd': [], 'col': []}
 
-    print(f"🚀 GRPO (Standard) Ray Training Started")
+    last_save_step = 0
+    SAVE_FREQ = 100000
+
+    print(f"🚀 GRPO (Standard) Ray Training Started | Target Steps: {TOTAL_TRAIN_STEPS}")
 
     try:
-        while ep < RAM_NUM_EPISODE:
+        # 修改循环条件: 基于总步数
+        while step < TOTAL_TRAIN_STEPS:
             w_ref = ray.put(learner.get_weights())
             results = ray.get([w.sample.remote(w_ref, global_base, MAX_T) for w in workers])
 
@@ -1425,18 +1689,301 @@ def train():
             if len(buffer) >= BATCH_SIZE:
                 learner.learn(buffer, step)
                 buffer = []
-                print(f"Ep {ep} | Step {step} | Rew {np.mean(logs['rew'][-100:]):.1f}")
-                if (ep // GROUP_SIZE) % 50 == 0:
+                print(f"Step {step}/{TOTAL_TRAIN_STEPS} | Ep {ep} | Rew {np.mean(logs['rew'][-100:]):.1f}")
+
+                # 修改保存逻辑: 基于步数间隔
+                if step - last_save_step >= SAVE_FREQ:
+                    last_save_step = step
                     torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
                     for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
     finally:
         ray.shutdown()
+        torch.save(learner.actor.state_dict(), f"{save_dir}/weights.pth")
+        for k, v in logs.items(): np.save(f"{save_dir}/{k}.npy", v)
 
 
 if __name__ == '__main__': train()
 
 ====================
 FILE: ./models/agent_grpo_ray.py
+====================
+import torch
+import torch.optim as optim
+import numpy as np
+from models.networks import Actor
+
+
+class Agent_GRPO_Ray:
+    def __init__(self, state_size, action_size, bs, lr, decay_max_step, gamma, eps_clip, K_epochs, entropy_coef,
+                 device, is_worker=False, adv_mode="tiered", use_dynamic_beta=True):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.bs = bs
+        self.lr = lr
+        self.decay_max_step = decay_max_step
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.entropy_coef = entropy_coef
+        self.device = device
+        # self.scales 已删除，因为不再需要物理坐标反归一化
+        self.entropy = 0
+
+        # 网络初始化
+        self.actor = Actor(state_size, action_size).to(device)
+
+        if not is_worker:
+            self.optimizer = optim.Adam(self.actor.parameters(), lr=lr)
+        else:
+            self.optimizer = None
+
+        # GRPO 变体配置
+        self.adv_mode = adv_mode
+        self.use_dynamic_beta = use_dynamic_beta
+        self.beta = 0.1  # 初始 beta
+
+    def act(self, state, deterministic=False):
+        # 1. 转为 Tensor
+        if not isinstance(state, torch.Tensor):
+            state = torch.FloatTensor(state).to(self.device)
+
+        # === 🛡️ 鲁棒性保护：输入清洗 ===
+        # 防止环境偶尔产生的 NaN 导致网络崩溃
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            state = torch.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        with torch.no_grad():
+            action_probs = self.actor(state)
+
+        # === 🛡️ 鲁棒性保护：输出清洗 ===
+        if torch.isnan(action_probs).any() or torch.isinf(action_probs).any():
+            action_probs = torch.ones_like(action_probs) / self.action_size
+
+        if deterministic:
+            action_tensor = torch.argmax(action_probs, dim=1)
+            log_prob = 0.0
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action_tensor = dist.sample()
+            log_prob = dist.log_prob(action_tensor).detach().cpu().numpy().item()
+
+        return int(action_tensor.cpu().numpy().flatten()[0]), log_prob
+
+    def get_weights(self):
+        """导出权重到 CPU (Ray 传输用)"""
+        return {k: v.cpu() for k, v in self.actor.state_dict().items()}
+
+    def set_weights(self, weights):
+        """加载权重"""
+        self.actor.load_state_dict(weights)
+
+    # [已删除] calculate_risk 函数
+
+    def calculate_group_advantages(self, group_trajectories, baseline_value):
+        group_returns = []
+        group_crashed = []
+
+        # 1. 计算每条轨迹的回报 (Return)
+        for traj in group_trajectories:
+            G = 0
+            # 倒序计算
+            for t in reversed(range(len(traj))):
+                s, a, r, ns, term, lp = traj[t]
+                G = r + self.gamma * G
+
+            group_returns.append(G)
+            # term 位于 tuple 的第4位 (index 4)
+            group_crashed.append(traj[-1][4])
+
+        group_returns_arr = np.array(group_returns)
+
+        # 2. 计算标准优势 (Z-Score Normalization)
+        # 这是 GRPO 的核心：(Return - Mean) / Std
+        group_mean = group_returns_arr.mean()
+        group_std = group_returns_arr.std() + 1e-8
+        final_adv = (group_returns_arr - group_mean) / group_std
+        # 截断，防止梯度爆炸
+        final_adv = np.clip(final_adv, -4.0, 4.0)
+
+        # 计算单纯的 Reward 之和 (用于日志显示，不参与更新)
+        avg_rew = np.mean([sum(t[2] for t in tr) for tr in group_trajectories])
+
+        return final_adv, avg_rew, group_mean
+
+    def learn(self, memory_list, current_total_timesteps):
+        if not memory_list or len(memory_list) < self.bs: return
+
+        # 解包数据 (Ray 传回来的是 list of tuples)
+        states, actions, rewards, next_states, dones, log_probs = zip(*memory_list)
+
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        actions = torch.tensor(np.array(actions), dtype=torch.long).to(self.device)
+        advantages = torch.tensor(np.array(rewards), dtype=torch.float32).to(
+            self.device)  # 注意：这里的 rewards 实际上存的是 Advantage
+        old_log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32).to(self.device)
+
+        # === 🛡️ 训练数据保护 ===
+        if torch.isnan(states).any(): states = torch.nan_to_num(states, nan=0.0)
+        if torch.isnan(advantages).any(): advantages = torch.nan_to_num(advantages, nan=0.0)
+
+        # 学习率线性衰减
+        decay = 1.0 - min(max(current_total_timesteps / self.decay_max_step, 0.0), 1.0)
+        cur_lr = self.lr * decay
+        for pg in self.optimizer.param_groups: pg['lr'] = max(cur_lr, 1e-6)
+
+        ds_size = states.size(0)
+        indices = np.arange(ds_size)
+
+        for _ in range(self.K_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, ds_size, self.bs):
+                idx = indices[start:start + self.bs]
+                mb_s, mb_a, mb_adv, mb_old_lp = states[idx], actions[idx], advantages[idx], old_log_probs[idx]
+
+                action_probs = self.actor(mb_s)
+                dist = torch.distributions.Categorical(action_probs)
+                mb_new_lp = dist.log_prob(mb_a)
+                dist_entropy = dist.entropy().mean()
+
+                ratio = torch.exp(mb_new_lp - mb_old_lp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * mb_adv
+
+                # KL 散度近似 (用于动态 Beta)
+                with torch.no_grad():
+                    approx_kl = 0.5 * ((mb_new_lp - mb_old_lp) ** 2).mean()
+
+                # Loss 计算
+                loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * dist_entropy
+
+                if self.use_dynamic_beta:
+                    loss += self.beta * approx_kl
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                self.optimizer.step()
+
+        self.entropy = dist_entropy.item()
+
+====================
+FILE: ./models/__init__.py
+====================
+
+
+====================
+FILE: ./models/networks.py
+====================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --- Actor (PPO & GRPO) ---
+class Actor(nn.Module):
+    def __init__(self, state_size, action_size, hidden=[512, 512]):
+        super(Actor, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])     # Perception
+        self.fc2 = nn.Linear(hidden[0], hidden[1])      # Thought
+        self.fc3 = nn.Linear(hidden[1], action_size)    # Action
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        action_prob = F.softmax(self.fc3(x), dim=1)
+        return action_prob
+
+# --- Critic (PPO Only) ---
+class Critic(nn.Module):
+    def __init__(self, state_size, hidden=[512, 512]):
+        super(Critic, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], 1)
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# --- Q-Network (DQN Only) ---
+class QNetwork(nn.Module):
+    def __init__(self, state_size, action_size, hidden=[512, 512]):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(state_size, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], action_size)
+        self.apply(weights_init_)
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+def weights_init_(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1)
+        torch.nn.init.constant_(m.bias, 0)
+
+====================
+FILE: ./models/rollout_buffer.py
+====================
+import numpy as np
+import random
+import torch
+from multiprocessing import Lock
+
+class Rollout_Buffer:
+    def __init__(self, manager=None):
+        self.lock = manager.Lock() if manager else Lock()
+        self.memory = manager.list() if manager else []
+
+    def remember(self, transition):
+        """
+            存储单步数据 (s, a, adv_val, ns, d, lp)
+        """
+        with self.lock:
+            self.memory.append(transition)
+
+    def extend(self, batch_data):
+        """
+            存储一批 (s, a, adv_val, ns, d, lp)
+        """
+        with self.lock:
+            self.memory.extend(batch_data)
+
+    def get_all_and_clear(self):
+        with self.lock:
+            batch = list(self.memory)
+            del self.memory[:]
+        return self._process_batch(batch)
+
+    def _process_batch(self, batch):
+        if not batch: return None, None, None, None, None, None
+        states, actions, rewards, next_states, dones, log_probs = zip(*batch)
+        states = torch.tensor(np.array(states), dtype=torch.float32)
+        actions = torch.tensor(np.array(actions), dtype=torch.long)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32)
+        dones = torch.tensor(np.array(dones), dtype=torch.float32)
+
+        if log_probs[0] is not None:
+            log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32)
+        else:
+            log_probs = None
+
+        return states, actions, rewards, next_states, dones, log_probs
+
+    def clear(self):
+        with self.lock:
+            del self.memory[:]
+
+    def __len__(self):
+        return len(self.memory)
+
+====================
+FILE: ./models/.ipynb_checkpoints/agent_grpo_ray-checkpoint.py
 ====================
 import torch
 import torch.optim as optim
@@ -1630,119 +2177,6 @@ class Agent_GRPO_Ray:
         self.entropy = dist_entropy.item()
 
 ====================
-FILE: ./models/__init__.py
-====================
-
-
-====================
-FILE: ./models/networks.py
-====================
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# --- Actor (PPO & GRPO) ---
-class Actor(nn.Module):
-    def __init__(self, state_size, action_size, hidden=[512, 512]):
-        super(Actor, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden[0])     # Perception
-        self.fc2 = nn.Linear(hidden[0], hidden[1])      # Thought
-        self.fc3 = nn.Linear(hidden[1], action_size)    # Action
-        self.apply(weights_init_)
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        action_prob = F.softmax(self.fc3(x), dim=1)
-        return action_prob
-
-# --- Critic (PPO Only) ---
-class Critic(nn.Module):
-    def __init__(self, state_size, hidden=[512, 512]):
-        super(Critic, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden[0])
-        self.fc2 = nn.Linear(hidden[0], hidden[1])
-        self.fc3 = nn.Linear(hidden[1], 1)
-        self.apply(weights_init_)
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
-
-# --- Q-Network (DQN Only) ---
-class QNetwork(nn.Module):
-    def __init__(self, state_size, action_size, hidden=[512, 512]):
-        super(QNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden[0])
-        self.fc2 = nn.Linear(hidden[0], hidden[1])
-        self.fc3 = nn.Linear(hidden[1], action_size)
-        self.apply(weights_init_)
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
-
-def weights_init_(m):
-    if isinstance(m, nn.Linear):
-        torch.nn.init.xavier_uniform_(m.weight, gain=1)
-        torch.nn.init.constant_(m.bias, 0)
-
-====================
-FILE: ./models/rollout_buffer.py
-====================
-import numpy as np
-import random
-import torch
-from multiprocessing import Lock
-
-class Rollout_Buffer:
-    def __init__(self, manager=None):
-        self.lock = manager.Lock() if manager else Lock()
-        self.memory = manager.list() if manager else []
-
-    def remember(self, transition):
-        """
-            存储单步数据 (s, a, adv_val, ns, d, lp)
-        """
-        with self.lock:
-            self.memory.append(transition)
-
-    def extend(self, batch_data):
-        """
-            存储一批 (s, a, adv_val, ns, d, lp)
-        """
-        with self.lock:
-            self.memory.extend(batch_data)
-
-    def get_all_and_clear(self):
-        with self.lock:
-            batch = list(self.memory)
-            del self.memory[:]
-        return self._process_batch(batch)
-
-    def _process_batch(self, batch):
-        if not batch: return None, None, None, None, None, None
-        states, actions, rewards, next_states, dones, log_probs = zip(*batch)
-        states = torch.tensor(np.array(states), dtype=torch.float32)
-        actions = torch.tensor(np.array(actions), dtype=torch.long)
-        rewards = torch.tensor(np.array(rewards), dtype=torch.float32)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float32)
-        dones = torch.tensor(np.array(dones), dtype=torch.float32)
-
-        if log_probs[0] is not None:
-            log_probs = torch.tensor(np.array(log_probs), dtype=torch.float32)
-        else:
-            log_probs = None
-
-        return states, actions, rewards, next_states, dones, log_probs
-
-    def clear(self):
-        with self.lock:
-            del self.memory[:]
-
-    def __len__(self):
-        return len(self.memory)
-
-====================
 FILE: ./models/.ipynb_checkpoints/rollout_buffer-checkpoint.py
 ====================
 import numpy as np
@@ -1851,6 +2285,112 @@ def weights_init_(m):
         torch.nn.init.constant_(m.bias, 0)
 
 ====================
+FILE: ./.ipynb_checkpoints/run_all_seeds-checkpoint.py
+====================
+
+import os
+# === 🚀 性能优化: 限制线程数 (必须在最前面) ===
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
+import subprocess
+import time
+
+# --- 实验配置 ---
+# 为了发论文，建议跑 3 个种子以画出阴影图。
+# 如果只是想快速测试代码是否报错，可以临时改为 [0]
+SEEDS = [0,1,2]
+
+ALGORITHMS = [
+    # 1. GRPO 主模型 (Ours)
+    ("experiments/train_grpo.py", "GRPO (Ours)"),
+
+    # 2. PPO 基线 (Baseline)
+    ("experiments/train_ppo.py", "PPO (Baseline)"),
+
+    # 3. DQN 基线 (Baseline)
+    ("experiments/train_dqn.py", "DQN (Baseline)"),
+
+    # 4. GRPO 消融实验 (Standard)
+    #("experiments/train_grpo_standard.py", "GRPO (Standard)")
+]
+
+
+def run():
+    print(f"🚀 开始全量实验! 总共 {len(ALGORITHMS)} 个算法, 每个跑 {len(SEEDS)} 个种子。")
+    print("⚠️ 警告：全量运行时间较长，请确保电源连接，不要让电脑休眠。\n")
+
+    start_all = time.time()
+
+    for script_path, algo_name in ALGORITHMS:
+        for seed in SEEDS:
+            print(f"{'=' * 60}")
+            print(f"▶️  正在运行: {algo_name} | Seed: {seed}")
+            print(f"   Command: python {script_path} --seed {seed}")
+            print(f"{'=' * 60}\n")
+
+            algo_start = time.time()
+
+            try:
+                # check=True: 遇到报错立即停止，方便你修 Bug
+                subprocess.run(["python", script_path, "--seed", str(seed)], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ 实验失败: {algo_name} (Seed {seed})")
+                print(f"错误信息: {e}")
+                # 这里选择 continue，即使 DQN 挂了，也不影响其他算法继续跑
+                continue
+            except KeyboardInterrupt:
+                print("\n🛑 用户手动停止实验。")
+                return
+
+            duration = (time.time() - algo_start) / 60
+            print(f"\n✅ {algo_name} (Seed {seed}) 完成! 耗时: {duration:.2f} 分钟\n")
+
+    total_duration = (time.time() - start_all) / 3600
+    print(f"🎉 所有实验已完成！总耗时: {total_duration:.2f} 小时。")
+    print("请运行 analysis/plot_learning_curves.py 查看最终对比图。")
+
+
+if __name__ == "__main__":
+    run()
+
+====================
+FILE: ./.ipynb_checkpoints/export_code-checkpoint.py
+====================
+import os
+
+# 设置要忽略的文件夹（比如虚拟环境、git目录、结果文件夹）
+IGNORE_DIRS = {'.git', '__pycache__', 'results', 'venv', '.idea', '.vscode'}
+# 设置输出文件名
+OUTPUT_FILE = 'project_code_context.txt'
+
+
+def merge_files():
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as outfile:
+        # 遍历当前目录
+        for root, dirs, files in os.walk("."):
+            # 过滤掉不需要的目录
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+
+            for file in files:
+                if file.endswith(".py"):
+                    file_path = os.path.join(root, file)
+                    # 写入分隔符和文件名，方便AI识别
+                    outfile.write(f"\n{'=' * 20}\nFILE: {file_path}\n{'=' * 20}\n")
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as infile:
+                            outfile.write(infile.read())
+                    except Exception as e:
+                        outfile.write(f"# Error reading file: {e}")
+                    outfile.write("\n")
+
+    print(f"完成！所有代码已合并到 {OUTPUT_FILE}，请将该文件发送给AI。")
+
+
+if __name__ == "__main__":
+    merge_files()
+
+====================
 FILE: ./envs/custom_merge_env.py
 ====================
 from logging import lastResort
@@ -1927,13 +2467,13 @@ class MergeEnv(AbstractEnv):
             },
             "action": {"type": "DiscreteMetaAction"},
             "lanes_count": 2,
-            "vehicles_count": 10,
+            "vehicles_count": 20,
             "initial_ego_speed": 20,
             "initial_traffic_speed": [20, 30],  # 随机生成这个速度范围的车辆
             "duration": 25,
             "collision_reward": -50.0,
-            "cooldown_steps": 3,                # 换道冷却时间
-            "frequent_lc_reward": -10.0,        # 频繁换道惩罚
+            "cooldown_steps": 0,                # 换道冷却时间
+            "frequent_lc_reward": 0,        # 频繁换道惩罚
             "target_speed": 30.0,               # 目标速度
             "offroad_terminal": False,
             #"simulation_frequency": 15,  # 物理仿真频率 (保持每秒15次)
@@ -2479,5 +3019,417 @@ if env_id not in registry:
     register(
         id=env_id,
         entry_point='envs.custom_highway_env:HighwayEnv',
+    )
+    #print(f"[CustomEnv] Successfully registered {env_id}")
+
+====================
+FILE: ./envs/.ipynb_checkpoints/custom_merge_env-checkpoint.py
+====================
+from logging import lastResort
+
+import numpy as np
+from gymnasium.envs.registration import register, registry
+from highway_env import utils
+from highway_env.envs.common.abstract import AbstractEnv
+from highway_env.envs.common.action import Action
+from highway_env.road.lane import LineType, StraightLane, SineLane
+from highway_env.road.road import Road, RoadNetwork
+from highway_env.vehicle.controller import ControlledVehicle
+from highway_env.vehicle.kinematics import Vehicle
+from highway_env.vehicle.objects import Obstacle
+
+# ================== 关键坐标定义 ==================
+# 主路关键点
+X_MAIN_START = 0        # a点: 主路起点
+X_MERGE_START = 600    # b点: 汇入开始 (匝道接入点)
+X_MERGE_END = 700     # c点: 汇入结束 (平行段结束)
+X_DESTINATION = 1300    # d点: 最终终点
+# 匝道关键点
+X_RAMP_START = 400     # j点: 匝道起点
+LEN_RAMP_CURVE = 50   # S形弯道长度 (决定了切入的缓急)
+# 匝道弯道起点 (k点)
+X_RAMP_CURVE_START = X_MERGE_START - LEN_RAMP_CURVE
+
+# 校验几何合理性
+if X_RAMP_CURVE_START < X_RAMP_START:
+    raise ValueError(f"配置错误：匝道太短了！起点{X_RAMP_START} 晚于弯道起点{X_RAMP_CURVE_START}")
+
+# ================== 增加状态特征 ==================
+_original_to_dict = Vehicle.to_dict
+def _new_to_dict(self, origin_vehicle=None, observe_intentions=True):
+    """
+    这是一个 Wrapper，用来拦截原始的 to_dict，并强行插入自定义数据
+    """
+    d = _original_to_dict(self, origin_vehicle, observe_intentions)
+    distance_to_merge = X_MERGE_END - self.position[0]
+    lane_id = self.lane_index[2]
+    on_main_lane = (lane_id in [0, 1])      # 在主路
+    if distance_to_merge < 0 or on_main_lane:
+        d["distance_to_merge"] = 0.0        # 认为已汇入：归零
+    else:
+        d["distance_to_merge"] = distance_to_merge
+    return d
+Vehicle.to_dict = _new_to_dict
+
+
+class MergeEnv(AbstractEnv):
+    metadata = {'render_modes': ['human', 'rgb_array'],
+                'render_fps': 15
+    }
+
+    def __init__(self, config: dict = None, render_mode: str = None):
+        super().__init__(config, render_mode)
+        self.reward_range = (-float('inf'), float('inf'))
+
+    @classmethod
+    def default_config(cls) -> dict:
+        config = super().default_config()
+        config.update({
+            "observation": {
+                "type": "Kinematics",
+                "vehicles_count": 10,
+                "features": ["x", "y", "vx", "vy", "heading", "distance_to_merge"],
+                # 注意：这里环境通常会将观测值（Observation）归一化到 [-1, 1] 之间
+                # 如果要修改，记得同时修改代码中的数值！
+                "features_range": {
+                    "x": [-500, 500], "y": [-40, 40], "vx": [-40, 40], "vy": [-40, 40], "distance_to_merge": [0, 700]
+                },
+                "absolute": False,
+                "order": "sorted"       # 按照与自车的距离进行排序
+            },
+            "action": {"type": "DiscreteMetaAction"},
+            "lanes_count": 2,
+            "vehicles_count": 20,
+            "initial_ego_speed": 20,
+            "initial_traffic_speed": [20, 30],  # 随机生成这个速度范围的车辆
+            "duration": 25,
+            "collision_reward": -50.0,
+            "cooldown_steps": 0,                # 换道冷却时间
+            "frequent_lc_reward": 0,        # 频繁换道惩罚
+            "target_speed": 30.0,               # 目标速度
+            "offroad_terminal": False,
+            #"simulation_frequency": 15,  # 物理仿真频率 (保持每秒15次)
+            #"policy_frequency": 5,  # 策略决策频率 (每秒做5次决策，相当于
+
+            "scaling": 4.0,     # 渲染缩放
+        })
+        return config
+
+    def _reset(self) -> None:
+        self._create_road()
+        self._create_vehicles()
+        # 汇入状态标志
+        self.has_merged = False
+        # 频繁换道记录
+        self.steps_since_change = self.config["cooldown_steps"]     # 初始设为已冷却
+        self.last_lane_index = self.vehicle.lane_index              # 记录初始车道
+        self.frequent_change = False                                # 频繁换道标志
+
+    def _create_road(self) -> None:
+        """
+            Make a road composed of a straight highway and a merging lane.
+        """
+        net = RoadNetwork()
+
+        # ==================车道限速 ==================
+        # Lane 0: 30 m/s (108 km/h)
+        # Lane 1: 25 m/s (90  km/h)
+        speed_limits = [25, 30]
+
+        # Highway lanes
+        c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
+        y = [0, StraightLane.DEFAULT_WIDTH]
+        line_pre = [[c, s], [n, s]]
+        line_merge = [[c, s], [n, s]]
+        line_post = [[c, s], [n, s]]
+        for i in range(2):
+            net.add_lane("a", "b", StraightLane([X_MAIN_START, y[i]], [X_MERGE_START, y[i]],
+                                                line_types=line_pre[i], speed_limit=speed_limits[i]))
+            net.add_lane("b", "c", StraightLane([X_MERGE_START, y[i]], [X_MERGE_END, y[i]],
+                                                line_types=line_merge[i], speed_limit=speed_limits[i]))
+            net.add_lane("c", "d", StraightLane([X_MERGE_END, y[i]], [X_DESTINATION, y[i]],
+                                                line_types=line_post[i], speed_limit=speed_limits[i]))
+
+        # Merging lane
+        amplitude = 3.25
+        ramp_y = y[1] + 6.5 + 4
+        # j->k (直行)
+        ljk = StraightLane([X_RAMP_START, ramp_y], [X_RAMP_CURVE_START, ramp_y],
+                           line_types=[c, c], forbidden=True)
+        # k->b (S弯)
+        lkb = SineLane(
+            ljk.position(ljk.length, -amplitude),
+            ljk.position(ljk.length + LEN_RAMP_CURVE, -amplitude),
+            amplitude,
+            2 * np.pi / (2 * LEN_RAMP_CURVE),
+            np.pi / 2,
+            line_types=[c, c], forbidden=True
+        )
+        # b->c (汇入)
+        lbc = StraightLane(lkb.position(lkb.length, 0),
+                           lkb.position(lkb.length, 0) + [X_MERGE_END - X_MERGE_START, 0],
+                           line_types=[n, c], forbidden=True)
+        net.add_lane("j", "k", ljk)
+        net.add_lane("k", "b", lkb)
+        net.add_lane("b", "c", lbc)
+        road = Road(network=net, np_random=self.np_random, record_history=self.config["show_trajectories"])
+        road.objects.append(Obstacle(road, lbc.position(X_MERGE_END - X_MERGE_START, 0)))
+        self.road = road
+
+    def _create_vehicles(self) -> None:
+        """
+            在合流场景中生成车辆
+            自车：在匝道起点 (j -> k)
+            他车：在主路起点 (a -> b)
+        """
+        other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+        self.controlled_vehicles = []
+
+        # 1. 生成自车
+        ego_lane = self.road.network.get_lane(("j", "k", 0))
+        controlled_vehicle = self.action_type.vehicle_class(
+            self.road,
+            position=ego_lane.position(0, 0),
+            heading=ego_lane.heading_at(0),
+            speed=self.config["initial_ego_speed"]
+        )
+        self.controlled_vehicles.append(controlled_vehicle)
+        self.road.vehicles.append(controlled_vehicle)
+        self.vehicle = self.controlled_vehicles[0]
+
+        # 2. 生成背景交通
+        vehicles_count = self.config["vehicles_count"]
+        for _ in range(vehicles_count):
+            for _ in range(20):  # retry
+                # ================= 基于驾驶习惯的车道分配 =================
+                lane_idx = self.np_random.choice([0, 1], p=[0.6, 0.4])
+                lane = self.road.network.get_lane(("a", "b", lane_idx))
+                x_pos = self.np_random.uniform(X_MAIN_START, X_MERGE_START)
+
+                valid = True
+                for v in self.road.vehicles:
+                    if abs(v.position[0] - lane.position(x_pos, 0)[0]) < 15:  # 前后车辆间距不小于 15
+                        valid = False
+                        break
+
+                if valid:
+                    # ================= 基于车道的速度分配 =================
+                    # lane_idx 0 -> 25~30 m/s (约 90~108 km/h)
+                    # lane_idx 1 -> 20~25 m/s (约 72~90 km/h)
+                    if lane_idx == 0:
+                        spd = self.np_random.integers(25, 31)
+                    elif lane_idx == 1:
+                        spd = self.np_random.integers(20, 26)
+                    else:
+                        raise ValueError(f"Unexpected lane_idx: {lane_idx}")
+
+                    veh = other_vehicles_type(
+                        self.road,
+                        position=lane.position(x_pos, 0),
+                        heading=lane.heading_at(x_pos),
+                        speed=spd
+                    )
+                    veh.randomize_behavior()
+                    veh.target_speed = spd  # 锁定速度
+                    self.road.vehicles.append(veh)
+                    break
+
+    def _reward(self, action: Action) -> float:
+        # ======== 获取当前车辆状态 ========
+        current_lane_index = self.vehicle.lane_index    # 当前车道
+        last_lane_index = self.last_lane_index          # 上一时刻车道
+        current_lane_id = current_lane_index[2]         # 当前车道ID
+        on_main_lane = (current_lane_id in [0, 1])      # 在主路
+        current_speed = self.vehicle.velocity[0]        # 当前车速
+        target_speed = self.config["target_speed"]      # 目标车速
+
+        # 是否有换道操作
+        lane_changed = self.vehicle.lane_index[2] != self.last_lane_index[2]
+
+        # =========== 奖励计算 ===========
+        # 1. 碰撞惩罚
+        if self.vehicle.crashed:
+            return self.config["collision_reward"]
+
+        # 2. 汇入奖励
+        r_merged = 0
+        # 汇入瞬间给予奖励
+        if on_main_lane and not self.has_merged:
+            r_merged = 10.0
+            self.has_merged = True  # 标记为已汇入
+
+        # 2. 行驶效率奖励
+        if self.has_merged:
+            # [主路巡航]：r_efficiency = r_speed - risk
+            current_risk = self._calculate_risk(current_lane_index, mode="front")
+            r_speed = 0.8 - np.abs(current_speed - target_speed) / 10     # 20m/s 时奖励为零
+            r_efficiency = 2 * (r_speed - current_risk)   # 当 risk > 0.8 时，智能体开的再快也有惩罚
+        else:
+            # [匝道加速]：惩罚低速
+            r_efficiency = -0.1 * max(0, 20 - current_speed)
+
+        # 3. 换道奖励 & 惩罚
+        r_lane_change = 0
+        if lane_changed:
+            if self.steps_since_change < self.config["cooldown_steps"]:
+                # 频繁换道惩罚
+                r_lane_change = self.config["frequent_lc_reward"]
+                self.frequent_change = True
+            else:
+                # 正常换道
+                # 换道收益 = 换道前的车道风险 - 当前车道的风险
+                current_risk = self._calculate_risk(current_lane_index, mode="back")
+                last_risk = self._calculate_risk(last_lane_index, mode="front")
+                r_lane_change = last_risk - current_risk
+                self.frequent_change = False
+
+            # 只要换了道，就重置计时器
+            self.steps_since_change = 0
+            self.last_lane_index = self.vehicle.lane_index
+        else:
+            # 没换道，计时器增加
+            self.steps_since_change += 1
+            self.frequent_change = False
+
+        return r_merged + r_efficiency + r_lane_change
+
+    def _get_front_vehicle(self, target_lane_index) -> Vehicle:
+        """
+            获取指定 target_lane 车道上，位于自车前方且距离最近的车辆
+        """
+        if not self.vehicle: return None
+        ego_x = self.vehicle.position[0]
+        ego_y = self.vehicle.position[1]
+        fronts = [
+            v for v in self.road.vehicles
+            if v is not self.vehicle
+               and v.lane_index[2] == target_lane_index[2]
+               and abs(v.position[1] - ego_y) < 5.0 # 防止主路和匝道使用重复的 id
+               and v.position[0] > ego_x
+        ]
+        if fronts: return min(fronts, key=lambda v: v.position[0])
+        return None
+
+    def _get_back_vehicle(self, target_lane_index) -> Vehicle:
+        """
+            获取指定 target_lane 车道上，位于自车后方且距离最近的车辆
+        """
+        if not self.vehicle: return None
+        ego_x = self.vehicle.position[0]
+        ego_y = self.vehicle.position[1]
+        backs = [
+            v for v in self.road.vehicles
+            if v is not self.vehicle
+               and v.lane_index[2] == target_lane_index[2]
+               and abs(v.position[1] - ego_y) < 5.0  # 防止主路和匝道使用重复的 id
+               and v.position[0] < ego_x
+        ]
+        if backs: return max(backs, key=lambda v: v.position[0])
+        return None
+
+    def _get_ttc_risk(self, target_lane_index, mode="front"):
+        """
+            计算 TTC (Time-To-Collision) 风险
+            公式:
+                TTC = Distance / Closing_Speed
+                TTC_Risk = Threshold / TTC
+        """
+        # 获取目标车道前车、后车
+        front_vehicle = self._get_front_vehicle(target_lane_index)
+        back_vehicle = self._get_back_vehicle(target_lane_index)
+
+        # ---- 计算风险 ----
+        front_ttc_risk = 0.0
+        back_ttc_risk = 0.0
+        # 前车 ttc 风险 (所有场景)
+        if front_vehicle:
+            dist_x = front_vehicle.position[0] - self.vehicle.position[0] - 5
+            closing_speed = self.vehicle.velocity[0] - front_vehicle.velocity[0]
+            if closing_speed > 1e-6:
+                ttc_threshold = 8.0         # 同车道与侧车道阈值相同，方便对比
+                ttc = max(dist_x, 0.1) / closing_speed
+                front_ttc_risk = ttc_threshold / ttc
+        # 后车 ttc 风险 (仅变道场景)
+        if mode == "back":
+            if back_vehicle:
+                dist_x = self.vehicle.position[0] - back_vehicle.position[0] - 5
+                closing_speed = back_vehicle.velocity[0] - self.vehicle.velocity[0]
+                if closing_speed > 1e-6:
+                    ttc_threshold = 5.0     # 变道稍微放宽一点
+                    ttc = max(dist_x, 0.1) / closing_speed
+                    back_ttc_risk = ttc_threshold / ttc
+
+        ttc_risk = max(front_ttc_risk, back_ttc_risk)
+        return ttc_risk
+
+    def _get_dist_risk(self, target_lane_index, mode="front"):
+        """
+            计算 Headway Risk (车距保持风险)
+            公式:
+                Dist_isk = ((Safe_Dist - Dist) / k) ^ 2
+        """
+        # 获取目标车道前车、后车
+        front_vehicle = self._get_front_vehicle(target_lane_index)
+        back_vehicle = self._get_back_vehicle(target_lane_index)
+
+        # ---- 计算风险 ----
+        front_dist_risk = 0.0
+        back_dist_risk = 0.0
+        # 前车空间风险 (所有场景)
+        if front_vehicle:
+            dist_x = front_vehicle.position[0] - self.vehicle.position[0] - 5
+            safe_dist_front = 30.0      # 跟车安全距离 (较长)
+            if dist_x < safe_dist_front:
+                intrusion = safe_dist_front - dist_x
+                front_dist_risk = (intrusion / 5.0) ** 2
+
+        # 后车空间风险 (仅变道场景)
+        if mode == "back":
+            if back_vehicle:
+                dist_x = self.vehicle.position[0] - back_vehicle.position[0] - 5
+                safe_dist_back = 15.0   # 变道适当放宽些
+                if dist_x < safe_dist_back:
+                    intrusion = safe_dist_back - dist_x
+                    back_dist_risk = (intrusion / 5.0) ** 2
+
+        dist_risk = max(front_dist_risk, back_dist_risk)
+        return dist_risk
+
+    def _calculate_risk(self, target_lane_index, mode="front"):
+        """
+            综合风险计算器
+            输出: 0.0 (安全) ~ 1.0 (极度危险, tanh饱和)
+        """
+        # 1. 分别计算两种物理风险
+        ttc_risk = self._get_ttc_risk(target_lane_index, mode)
+        dist_risk = self._get_dist_risk(target_lane_index, mode)
+
+        # 2. 取最大值作为当前车道的瓶颈风险
+        raw_risk = max(ttc_risk, dist_risk)
+
+        # 3. 归一化映射 (使用 tanh 防止数值无限大)
+        # 0.1 是缩放系数，使得:
+        # raw_risk = 5.0  -> tanh(0.5) = 0.46
+        # raw_risk = 10.0 -> tanh(1.0) = 0.76
+        # raw_risk = 20.0 -> tanh(2.0) = 0.96
+        normalized_risk = np.tanh(raw_risk * 0.1)
+
+        return normalized_risk
+
+    def _is_terminated(self) -> bool:
+        return self.vehicle.crashed
+
+    def _is_truncated(self) -> bool:
+        return self.time >= self.config["duration"]
+
+    def _cost(self, action: int) -> float:
+        return float(self.vehicle.crashed)
+
+# 改用新名字，并添加防重复注册检查
+env_id = 'my-merge-v0'
+if env_id not in registry:
+    register(
+        id=env_id,
+        entry_point='envs.custom_merge_env:MergeEnv',
     )
     #print(f"[CustomEnv] Successfully registered {env_id}")

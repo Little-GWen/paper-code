@@ -11,13 +11,13 @@ SAVE_DIR = '../analysis'
 SAMPLE_RATE = 100  # 采样率：每100个点取1个，数据点多了，采样可以稀疏一点
 
 # ⚠️ 关键设置：这必须和你训练时的 TOTAL_TRAIN_STEPS 一致
-TOTAL_TRAIN_STEPS = 3000000
+TOTAL_TRAIN_STEPS = 5000000
 
 experiments_config = {
     'GRPO (Ours)': {
         'folder': 'grpo_main',
         'color': '#1f77b4',
-        'reward_fn': 'rew.npy'  # GRPO 保存的是 rew.npy
+        'reward_fn': 'rewards.npy'  # GRPO 保存的是 rewards.npy
     },
     'PPO (Baseline)': {
         'folder': 'ppo',
@@ -30,10 +30,10 @@ experiments_config = {
         'reward_fn': 'rewards.npy'
     },
     # 如果有 Standard 对比
-    'GRPO (Standard)': {
-        'folder': 'grpo_standard',
+    'GRPO (G=256)': {
+        'folder': 'grpo_256',
         'color': '#2ca02c',
-        'reward_fn': 'rew.npy'
+        'reward_fn': 'rewards.npy'
     },
 }
 

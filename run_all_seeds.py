@@ -10,11 +10,11 @@ import time
 # --- 实验配置 ---
 # 为了发论文，建议跑 3 个种子以画出阴影图。
 # 如果只是想快速测试代码是否报错，可以临时改为 [0]
-SEEDS = [0]
+SEEDS = [0,1,2]
 
 ALGORITHMS = [
     # 1. GRPO 主模型 (Ours)
-    ("experiments/train_grpo.py", "GRPO (Ours)"),
+    #("experiments/train_grpo.py", "GRPO (Ours)"),
 
     # 2. PPO 基线 (Baseline)
     ("experiments/train_ppo.py", "PPO (Baseline)"),

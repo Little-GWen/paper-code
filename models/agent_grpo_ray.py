@@ -96,35 +96,6 @@ class Agent_GRPO_Ray:
         group_mean = group_returns_arr.mean()
         group_std = group_returns_arr.std() + 1e-8
         final_adv = (group_returns_arr - group_mean) / group_std
-
-        # 3. Tiered Advantage 调整 (无 Risk 版本)
-        # 逻辑：保留“幸存者”与“撞车者”的分层，保留“Global Trend”奖励
-        if self.adv_mode == "tiered":
-            # 计算趋势信号：这组表现比历史基准(baseline)好了多少？
-            trend = np.clip((group_mean - baseline_value), -1.0, 1.0)
-
-            survivor_mask = ~np.array(group_crashed, dtype=bool)
-            crasher_mask = np.array(group_crashed, dtype=bool)
-
-            if np.any(survivor_mask):
-                # 幸存者优势 = 原始排名 + 趋势奖励
-                # (去掉了之前的 "- surv_risks")
-                surv_adv = final_adv[survivor_mask] + (0.2 * trend)
-
-                # 幸存者内部再次归一化 (让幸存者之间也能分出高下)
-                if len(surv_adv) > 1:
-                    surv_adv = (surv_adv - surv_adv.mean()) / (surv_adv.std() + 1e-8)
-
-                final_adv[survivor_mask] = surv_adv
-
-            if np.any(crasher_mask):
-                if np.any(survivor_mask):
-                    # 撞车者的得分，必须比最差的幸存者还要低 (分层打击)
-                    final_adv[crasher_mask] = final_adv[survivor_mask].min() - 2.0
-                else:
-                    # 全员撞车，全员扣分
-                    final_adv[crasher_mask] -= 1.0
-
         # 截断，防止梯度爆炸
         final_adv = np.clip(final_adv, -4.0, 4.0)
 

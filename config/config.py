@@ -14,17 +14,17 @@ RAM_ENV_NAME = 'my-merge-v0'
 # --- 训练时长控制 (Unified Training Steps) ---
 # 统一设定总步数，替代 Episode 控制
 # 3,000,000 步 ≈ 50,000 Episodes * 60 Steps
-TOTAL_TRAIN_STEPS = 3000000
+TOTAL_TRAIN_STEPS = 5000000
 
 # 原有参数 (保留，但不再作为主循环控制)
 RAM_NUM_EPISODE = 50000
-MAX_T = 60
+MAX_T = 50
 
 # 训练参数
 NUM_PROCESSES = 30
 
 # --- PPO/DQN 参数 ---
-BATCH_SIZE = 1024
+BATCH_SIZE = 8192
 LEARNING_RATE = 1e-4
 GAMMA = 0.985
 # 衰减参数：对齐总步数

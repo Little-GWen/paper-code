@@ -11,11 +11,11 @@ DEVICE = torch.device("cuda:{}".format(GPU) if torch.cuda.is_available() else "c
 RAM_ENV_NAME = 'my-merge-v0'
 
 # --- 训练时长控制 (Unified Training Steps) ---
-TOTAL_TRAIN_STEPS = 3000000  # 3M steps
+TOTAL_TRAIN_STEPS = 5000000  # 3M steps
 
 # 原有参数
 RAM_NUM_EPISODE = 80000
-MAX_T = 60
+MAX_T = 50
 
 # 训练参数
 NUM_PROCESSES = 30
@@ -31,7 +31,7 @@ DECAY_MAX_STEP = TOTAL_TRAIN_STEPS
 EPS_CLIP = 0.1          # 0.2 -> 0.1 配合强力的 Tiered Advantage 信号
 K_EPOCHS = 10
 ENTROPY_COEF = 0.001    # 必须比 PPO 更低
-GROUP_SIZE = 32
+GROUP_SIZE = 128
 
 # --- 全局随机种子设置函数 ---
 def set_seed(seed):
